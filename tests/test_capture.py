@@ -27,14 +27,15 @@ EXPECTED_HEIGHT = 1080
 EXPECTED_FMT = "YU12"
 FRAME_COUNT = 30  # Always capture 30 frames
 FPS_TOLERANCE = 0.15
+CAPTURE_TIMEOUT_S = 5.0  # hard timeout on the streaming capture, not the pytest one
 EXPECTED_FRAME_SIZE = EXPECTED_WIDTH * EXPECTED_HEIGHT * 3 // 2
 EXPECTED_INTERVAL_MS = 1000 / 30  # 33.33ms for 30fps
 
 
-def run_v4l2_ctl(args):
+def run_v4l2_ctl(args, timeout=None):
     """Run v4l2-ctl and return combined stdout+stderr."""
     cmd = ["v4l2-ctl", "--device", DEVICE_PATH] + args
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(f"v4l2-ctl failed: {result.stderr}")
     return result.stdout + result.stderr
@@ -107,13 +108,18 @@ def test_capture_30_frames_verify_timing_and_sequences():
         tmp_path = tmp.name
     
     try:
-        output = run_v4l2_ctl([
-            "--stream-mmap",
-            f"--stream-count={FRAME_COUNT}",
-            f"--stream-to={tmp_path}",
-            "--stream-show-delta-now",
-            "--verbose"
-        ])
+        try:
+            output = run_v4l2_ctl([
+                "--stream-mmap",
+                f"--stream-count={FRAME_COUNT}",
+                f"--stream-to={tmp_path}",
+                "--stream-show-delta-now",
+                "--verbose"
+            ], timeout=CAPTURE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                f"v4l2 capture did not produce {FRAME_COUNT} frames within "
+                f"{CAPTURE_TIMEOUT_S}s (card stalled / no frames)")
         
         sequences, deltas = parse_stream_output(output)
         
