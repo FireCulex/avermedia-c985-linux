@@ -1,45 +1,20 @@
-# Kernel build artifacts
-*.o
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+.env
+*.so
 *.ko
-*.mod.o
 *.mod.c
-*.symvers
-*.order
+*.mod.o
+*.o
+*.cmd
 Module.symvers
 modules.order
-
-# Firmware build artifacts
-*.bin
-*.elf
-*.map
-
-# Object files
-poc/*.o
-kernel/c985/*.o
-
-# Compiled tools
-tools/c985_v4l2d
-
-# Ghidra project files
-*.gpr
-*.rep
-ghidra_*/
-
-# Debug/temporary files
-*.log
-*.tmp
-*.bak
-*.swp
-*~
-
-# IDE/editor files
-.vscode/
-.idea/
-*.sublime-*
-
-# OpenCode config
 .opencode/
-
-# System files
-.DS_Store
-Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -35,7 +35,6 @@ C985_DEVICE=/dev/video2 ./run_tests.sh  # Override device path
 
 ## Key Conventions
 - Kernel build uses `LLVM=1` (Clang) — required for this codebase
-- Module param `auto_release=0` disables auto 0x30 release after frame (debug)
 - Firmware loaded from kernel `request_firmware()` — expects `avermedia/qpvidfwpcie.bin` + `avermedia/qpaudfw.bin` in `/lib/firmware/`
 - Debugfs at `/sys/kernel/debug/c985/` exposes: `regs`, `mbox_log`, `frame_read`, `cpr_peek`, `dma_status`
 

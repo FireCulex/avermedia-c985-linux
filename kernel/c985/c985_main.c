@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "c985.h"
 
-static bool auto_release = true;
+static bool auto_release;
 module_param(auto_release, bool, 0444);
-static bool no_fwload;
-module_param(no_fwload, bool, 0444);
-MODULE_PARM_DESC(auto_release, "send opcode 0x30 release after each 0x40 frame-done");
+MODULE_PARM_DESC(auto_release, "send opcode 0x30 release after each 0x40 frame-done (default: disabled)");
 
 static const struct pci_device_id c985_ids[] = {
     { PCI_DEVICE(C985_VENDOR, C985_DEVICE) },
@@ -144,16 +142,11 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     /* Initialize DMA */
     c985_dma_init(dev);
 
-/* Load firmware */
-    if (no_fwload) {
-        dev_dbg(&dev->pdev->dev,
-                 "no_fwload=1: skipping fw upload (fw pre-booted, e.g. via c985_poc --fwload)\n");
-    } else {
+    /* Load firmware */
     err = c985_firmware_load(dev);
     if (err) {
         dev_err(&dev->pdev->dev, "Firmware load failed: %d\n", err);
         goto err_regions;
-    }
     }
 
     /* Debugfs */

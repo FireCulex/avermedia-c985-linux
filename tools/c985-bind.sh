@@ -11,7 +11,7 @@ detect_pci_id() {
     for dev in /sys/bus/pci/devices/*; do
         ven=$(cat "$dev/vendor" 2>/dev/null || true)
         dev_id=$(cat "$dev/device" 2>/dev/null || true)
-        if [ "$ven" = "$VENDOR" ] && [ "$dev_id" = "$DEVICE" ]; then
+        if [ "${ven^^}" = "${VENDOR^^}" ] && [ "${dev_id^^}" = "${DEVICE^^}" ]; then
             basename "$dev"
             return 0
         fi
@@ -81,7 +81,7 @@ case "${1:-}" in
 
     # Load module if not loaded; if stale (srcversion mismatch), force-reload
     if ! lsmod | grep -q "^c985 "; then
-        insmod "$OUR_KO" auto_release=0 $DEBUG 2>/dev/null || true
+        insmod "$OUR_KO" $DEBUG 2>/dev/null || true
     else
         disk_sv=$(modinfo "$OUR_KO" -F srcversion 2>/dev/null)
         live_sv=$(cat /sys/module/c985/srcversion 2>/dev/null)
@@ -90,7 +90,7 @@ case "${1:-}" in
             rmmod c985 2>/dev/null || true
             sleep 0.2
             rmmod -f c985 2>/dev/null || true
-            insmod "$OUR_KO" auto_release=0 $DEBUG 2>/dev/null || true
+            insmod "$OUR_KO" $DEBUG 2>/dev/null || true
         fi
     fi
     
