@@ -498,6 +498,23 @@ int c985_firmware_load(struct c985_dev *dev)
     c985_write_bar1(dev, 0x614, 0);
     dev_dbg(&dev->pdev->dev, "GPIO defaults applied (0x50, 0x610, 0x614)\n");
 
+    /* STEP: Pre-upload mailbox handshake - F1 SystemOpen then F3 SystemClose.
+     * Windows dbgview ground truth (memory 5f57d932): F1(open,78.362s) ->
+     * F3(close,78.362s) happen BEFORE CQLCodec_FWDownload, while the ARM is
+     * still HALTED. No response is awaited (ARM polls 0x6CC only once running).
+     * F1 param = m_codec_function (0x80000004 task0); F3 carries no param. */
+    c985_write_bar1(dev, C985_TO_ARM_PARAM0, 0x80000004);
+    c985_write_bar1(dev, C985_TO_ARM_MSG_STATUS, 0x00000001);
+    wmb();
+    c985_write_bar1(dev, C985_TO_ARM_MESSAGE, 0x000000F1);
+    wmb();
+    c985_write_bar1(dev, C985_TO_ARM_MSG_STATUS, 0x00000001);
+    wmb();
+    c985_write_bar1(dev, C985_TO_ARM_MESSAGE, 0x000000F3);
+    wmb();
+    dev_dbg(&dev->pdev->dev,
+             "Pre-upload mailbox handshake: F1 SystemOpen(fn 0x80000004) -> F3 SystemClose\n");
+
     /* Copy firmware to DMA-coherent buffers (request_firmware returns vmalloc memory) */
     video_buf = dma_alloc_coherent(&dev->pdev->dev, fw_video->size,
                                     &dev->fw_video_dma, GFP_KERNEL);

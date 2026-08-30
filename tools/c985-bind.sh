@@ -79,7 +79,20 @@ case "${1:-}" in
         fi
     done
 
-    # Load module if not loaded; if stale (srcversion mismatch), force-reload
+    # If module loaded but device not bound, unload first (failed probe leaves module)
+    if lsmod | grep -q "^c985 "; then
+        if [ ! -L "$DRV/$PCI_ID" ]; then
+            echo "bind: c985 loaded but $PCI_ID not bound; unloading stale module" >&2
+            rmmod c985 2>/dev/null || true
+            sleep 0.2
+            rmmod -f c985 2>/dev/null || true
+        fi
+    fi
+
+    # Load module if not loaded; if stale (srcversion mismatch), force-reload.
+    # insmod triggers probe(); the module remains loaded even if probe fails,
+    # so a separate $DRV/bind write would trigger a SECOND probe attempt. We
+    # must load exactly once and check the result, never double-bind.
     if ! lsmod | grep -q "^c985 "; then
         insmod "$OUR_KO" $DEBUG 2>/dev/null || true
     else
@@ -93,29 +106,35 @@ case "${1:-}" in
             insmod "$OUR_KO" $DEBUG 2>/dev/null || true
         fi
     fi
-    
+
     # Wait for driver directory to appear (up to 5 seconds)
     for i in 1 2 3 4 5 6 7 8 9 10; do
         [ -d "$DRV" ] && break
         sleep 0.5
     done
-    
+
     if [ ! -d "$DRV" ]; then
         echo "driver directory not found after module load" >&2
         exit 1
     fi
-    
-    # Add PCI ID to driver (ignore "File exists")
-    swrite "$DRV/new_id" "$VENDOR $DEVICE"
-    
-    # Bind device
-    swrite "$DRV/bind" "$PCI_ID"
-    
-    # Verify
+
+    # insmod's probe should have already claimed the device via the module's
+    # PCI ID table. Only bind manually if the device still isn't bound and the
+    # module was loaded without a matching ID table entry.
     if [ -L "$DRV/$PCI_ID" ]; then
         echo "bound: $(readlink "$DRV/$PCI_ID")"
+    elif [ -f "$DRV/bind" ]; then
+        swrite "$DRV/new_id" "$VENDOR $DEVICE"
+        swrite "$DRV/bind" "$PCI_ID"
+        if [ -L "$DRV/$PCI_ID" ]; then
+            echo "bound: $(readlink "$DRV/$PCI_ID")"
+        else
+            echo "failed to bind" >&2
+            exit 1
+        fi
     else
-        echo "failed to bind" >&2
+        echo "failed to bind: driver has no bind interface (probe failed)" >&2
+        rmmod c985 2>/dev/null || true
         exit 1
     fi
     ;;
