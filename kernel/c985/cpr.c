@@ -3,7 +3,7 @@
 
 /* CPR (Card Program Register) primitives for kernel driver
  * Transcribed from Windows driver assembly (CPR_MemoryRead/Write)
- * and userspace poc/cpr.c
+ *
  */
 
 #define CPR_TIMEOUT_MS        3000

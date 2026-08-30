@@ -2,11 +2,11 @@
 #include "c985.h"
 
 /*
- * Firmware boot sequence ported byte-for-byte from the working userspace
- * driver (~/github/c985: qphci.c, cqlcodec.c, firmware.c, qpfwapi.c).
+ * Firmware boot sequence ported byte-for-byte from the reference driver
+ * (qphci.c, cqlcodec.c, firmware.c, qpfwapi.c).
  *
  * KEY DIFFERENCE vs earlier attempts: the firmware is configured for
- * POLLING MODE before ARM release (QPSOS config 0x2F1090 = 0). The ARM
+ * POLLING MODE post-firmware-load (QPSOS config 0x2F1090 = 0). The ARM
  * polls TO_ARM_MSG_STATUS (0x6CC) and clears it per command; host-side
  * interrupts are NOT required for mailbox operation.
  */
@@ -537,9 +537,6 @@ int c985_firmware_load(struct c985_dev *dev)
         dev_warn(&dev->pdev->dev, "No audio firmware, skipping audio upload\n");
     }
 
-    /* STEP: QPSOS configuration - POLLING MODE before ARM release */
-    c985_write_qpsos_config(dev);
-
     /* STEP: Upload video firmware (0x0) */
     ret = c985_dma_upload(dev, dev->fw_video_dma, FW_VIDEO_OFFSET,
                           fw_video->size, "video FW");
@@ -547,6 +544,9 @@ int c985_firmware_load(struct c985_dev *dev)
         goto err_free_all;
     c985_cpr_verify_spot(dev, fw_video->data, fw_video->size,
                          FW_VIDEO_OFFSET, "video");
+
+    /* STEP: QPSOS configuration - POLLING MODE post-firmware-load */
+    c985_write_qpsos_config(dev);
 
     /* STEP: Pre-boot delay */
     msleep(250);

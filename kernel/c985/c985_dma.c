@@ -272,7 +272,7 @@ int c985_dma_read_frame_mode_submit(struct c985_dev *dev, u32 card_addr,
     reinit_completion(&chan->done);
 
     /* CardOffsetEx geometry IDENTICAL to the verified c985_dma_read_frame_mode
-     * path (daemon render_frame proven byte-good): byte[32-39] = width/32,
+     * path: byte[32-39] = width/32,
      * byte[40-47] = 16 (Y) / 8 (chroma), byte[56+] = DataSwap 3. */
     offex = ((u64)(width / 32) << 32) |
             ((u64)(chroma ? 8 : 16) << 40) |

@@ -243,7 +243,7 @@ void c985_mbox_release_last(struct c985_dev *dev)
     dev->mbox_slots[0] = size_dw;    /* 0x6F4: total frame size in DWORDs */
     dev->mbox_slots[1] = pts;        /* 0x6F0 */
     dev->mbox_slots[2] = pts_valid;  /* 0x6EC */
-    dev->mbox_slots[4] = ring_idx;   /* 0x6E4 (slot3 0x6E8 left 0, per daemon) */
+    dev->mbox_slots[4] = ring_idx;   /* 0x6E4 (slot3 0x6E8 left 0) */
 
     c985_mbox_send_polling(dev, 0x30, tag, r->task_id, false, 200);
 
@@ -346,7 +346,7 @@ int c985_mbox_wait_and_read(struct c985_dev *dev, unsigned long timeout_ms)
 
 /* ---- Interrupt-driven frame FIFO (v4l2 streaming path) ----
  *
- * Replaces the userspace daemon's polling (mbox_drain debugfs + 20ms sleep)
+ * Replaces polling (mbox_drain debugfs + 20ms sleep)
  * with: ISR detects ARM->host doorbell bit24 -> c985_mbox_isr_service reads
  * the 7-word mailbox burst, clears 0x6C8 bit0 (unblock DTM), and if the
  * opcode is 0x40 pushes a c985_frame_desc onto the FIFO and schedules the

@@ -41,7 +41,7 @@ struct c985_v4l2 {
     struct list_head ready;
     unsigned int queued_count;
 
-    /* streaming kthread (mirrors the proven userspace daemon loop) */
+    /* streaming kthread */
     struct task_struct *thread;
     bool thread_stop;             /* set to request thread exit */
 
@@ -78,7 +78,7 @@ static struct c985_buf *c985_v4l2_next_buf(struct c985_v4l2 *c)
 }
 
 /* Render one descriptor into one buffer: 3 synchronous frame-mode DMA reads
- * (Y, U, V=U+0x40) exactly like the daemon's render_frame(), then DQBUFs.
+ * (Y, U, V=U+0x40), then DQBUFs.
  * Caller holds q_lock for list access but we drop it around the (slow) DMA. */
 static void c985_v4l2_render_and_done(struct c985_v4l2 *c,
                                       struct c985_buf *buf,
@@ -115,8 +115,7 @@ out:
                     rc ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 }
 
-/* Streaming kthread: the kernel-side equivalent of the daemon's ST_STREAMING
- * loop. Blocks on the doorbell waitqueue (woken by the ISR on ARM->host
+/* Streaming kthread: blocks on the doorbell waitqueue (woken by the ISR on ARM->host
  * doorbell bit24), reads the mailbox burst, renders into the next queued
  * buffer, and releases the card ring slot via 0x30. */
 static int c985_v4l2_thread(void *data)
@@ -172,7 +171,7 @@ static int c985_v4l2_thread(void *data)
 
         c985_v4l2_render_and_done(c, buf, &d);
 
-        /* Release the card ring slot via the proven daemon path. */
+        /* Release the card ring slot. */
         c985_mbox_release_last(dev);
     }
 
@@ -285,7 +284,7 @@ static void c985_stop_streaming(struct vb2_queue *q)
         vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
     }
 
-    /* Halt ARM to fully quiesce (matches daemon full-cycle teardown). */
+    /* Halt ARM to fully quiesce. */
     c985_v4l2_teardown(dev);
 }
 
@@ -492,7 +491,7 @@ void c985_v4l2_stop_encoder(struct c985_dev *dev)
 
 void c985_v4l2_teardown(struct c985_dev *dev)
 {
-    /* 0xF3 SystemClose full session teardown (matches daemon stop_sequence).
+    /* 0xF3 SystemClose full session teardown.
      * No ARM halt: keep firmware booted so a subsequent stream-open can
      * re-issue F1/F2 without a full re-upload. */
     c985_enc_send(dev, 0xF3, 0, 500, NULL, 0);
