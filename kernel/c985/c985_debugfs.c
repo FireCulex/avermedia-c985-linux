@@ -269,8 +269,8 @@ static ssize_t c985_debugfs_mbox_send(struct file *file, const char __user *buf,
     dev_dbg(&dev->pdev->dev, "mbox_send debugfs: mbox_slots[0..4]=0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
              dev->mbox_slots[0], dev->mbox_slots[1], dev->mbox_slots[2], dev->mbox_slots[3], dev->mbox_slots[4]);
 
-    ret = c985_mbox_send_polling(dev, opcode, param0, task_id, has_resp,
-                                 timeout_ms);
+ret = c985_mbox_send_polling(dev, opcode, param0, task_id, has_resp, false,
+                             timeout_ms);
 
     dev_dbg(&dev->pdev->dev,
              "mbox_send debugfs: ret=%d clear_us=%lld resp_us=%lld ack=0x%08x\n",

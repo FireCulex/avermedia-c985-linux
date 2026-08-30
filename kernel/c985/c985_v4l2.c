@@ -438,7 +438,8 @@ struct c985_enc_step {
 };
 
 static int c985_enc_send(struct c985_dev *dev, u16 opcode, u32 param0,
-                         unsigned long to, const u32 *slots, int nslots)
+                         unsigned long to, const u32 *slots, int nslots,
+                         bool bare)
 {
     int i;
 
@@ -446,7 +447,22 @@ static int c985_enc_send(struct c985_dev *dev, u16 opcode, u32 param0,
         dev->mbox_slots[i] = (i < nslots) ? slots[i] : 0;
 
     return c985_mbox_send_polling(dev, opcode, param0, C985_ENC_TASK,
-                                  false, to);
+                                  false, bare, to);
+}
+
+/* Direct BAR1 write of the encoder config block, descending 0x6F8..0x6D0,
+ * matching Windows CQLCodec_UpdateEncoderConfig's QPFWENCAPI_Set* burst
+ * (each setter is a bare RegisterWrite, no mailbox message). The subsequent
+ * UpdateConfig 0x06 commits this burst to firmware. */
+#define C985_ENC_CFG_REGS 11     /* 0x6F8 .. 0x6D0 inclusive */
+
+static void c985_enc_write_config(struct c985_dev *dev, const u32 *cfg)
+{
+    int i;
+
+    for (i = 0; i < C985_ENC_CFG_REGS; i++)
+        c985_write_bar1(dev, C985_TO_ARM_PARAM0 - i * 4, cfg[i]);
+    wmb();
 }
 
 int c985_v4l2_boot_encoder(struct c985_dev *dev)
@@ -462,16 +478,20 @@ int c985_v4l2_boot_encoder(struct c985_dev *dev)
         { 0x10, 0x02,       200, { 0xF1F1F1DA, 0xB6F1F1B6 }, 2 },
     };
     u32 picres = (C985_HEIGHT << 16) | C985_WIDTH;
-    u32 block[10] = {
-        picres, 0x0f7c0609, 0x005003e8, 0x1f4007d0, 0x80002000,
-        0x6001000a, picres, 0x10, 0x01121080, 0x200,
+    /* Raw-profile config block, member order 0x6F8..0x6D0:
+     * SysCtrl, PicRes, InCtrl, RateCtrl, BitRate, Filter, GOPLF,
+     * ET(=picres: W/H for VDCM ring geometry), BlockSize, OutPicRes,
+     * AudioControlEx. */
+    u32 cfg[C985_ENC_CFG_REGS] = {
+        0x2101b20c, picres, 0x0f7c0609, 0x005003e8, 0x1f4007d0,
+        0x80002000, 0x6001000a, picres, 0x10, 0x01121080, 0x200,
     };
-    int i;
+    int i, ret;
 
     for (i = 0; i < ARRAY_SIZE(steps); i++) {
-        int ret = c985_enc_send(dev, steps[i].opcode, steps[i].param0,
-                                steps[i].timeout_ms, steps[i].slots,
-                                steps[i].nslots);
+        ret = c985_enc_send(dev, steps[i].opcode, steps[i].param0,
+                            steps[i].timeout_ms, steps[i].slots,
+                            steps[i].nslots, false);
         if (ret && ret != -ETIMEDOUT) {
             dev_err(&dev->pdev->dev, "boot step 0x%02x failed: %d\n",
                     steps[i].opcode, ret);
@@ -479,14 +499,22 @@ int c985_v4l2_boot_encoder(struct c985_dev *dev)
         }
     }
 
-    return c985_enc_send(dev, 0x01, 0x2101b20c, 300, block, 10);
+    /* Windows: CQLCodec_Set -> register burst 0x6F8..0x6D0, then commit
+     * with UpdateConfig 0x06 (bare), then bare StartEncoder 0x01. */
+    c985_enc_write_config(dev, cfg);
+
+    ret = c985_enc_send(dev, 0x06, C985_ENC_TASK, 300, NULL, 0, true);
+    if (ret && ret != -ETIMEDOUT)
+        return ret;
+
+    return c985_enc_send(dev, 0x01, C985_ENC_TASK, 300, NULL, 0, true);
 }
 
 void c985_v4l2_stop_encoder(struct c985_dev *dev)
 {
     /* 0x02 StopEncoder (bStopAtGOP=0). Clears the task run-flag so the
      * firmware DTM drops subsequent 0x40 traffic. */
-    c985_enc_send(dev, 0x02, 0, 500, NULL, 0);
+    c985_enc_send(dev, 0x02, 0, 500, NULL, 0, false);
 }
 
 void c985_v4l2_teardown(struct c985_dev *dev)
@@ -494,7 +522,7 @@ void c985_v4l2_teardown(struct c985_dev *dev)
     /* 0xF3 SystemClose full session teardown.
      * No ARM halt: keep firmware booted so a subsequent stream-open can
      * re-issue F1/F2 without a full re-upload. */
-    c985_enc_send(dev, 0xF3, 0, 500, NULL, 0);
+    c985_enc_send(dev, 0xF3, 0, 500, NULL, 0, false);
     msleep(100);
 }
 

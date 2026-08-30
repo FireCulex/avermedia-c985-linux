@@ -42,7 +42,7 @@ static void c985_mbox_post(struct c985_dev *dev, u32 status_word, u32 msg_word)
 }
 
 int c985_mbox_send_polling(struct c985_dev *dev, u16 opcode, u32 param0,
-                           u8 task_id, bool has_resp,
+                           u8 task_id, bool has_resp, bool bare,
                            unsigned long timeout_ms)
 {
     unsigned long deadline;
@@ -74,7 +74,9 @@ int c985_mbox_send_polling(struct c985_dev *dev, u16 opcode, u32 param0,
 
     /* Payload window first (descending 0x6F8..0x6D0), then status+message
      * (firmware down-walks the payload window on consume - Windows writes
-     * the full config block immediately before StartEncoder) */
+     * the full config block immediately before StartEncoder). bare=true
+     * matches Windows QPFWAPI_SendMessageToARM: write ONLY 0x6CC+0x6FC (no
+     * 0x6F8, no payload window) so a pre-written register burst survives. */
     r->param0_written = param0;
     r->task_id = task_id;
     if (opcode == 0x30) {
@@ -85,20 +87,22 @@ int c985_mbox_send_polling(struct c985_dev *dev, u16 opcode, u32 param0,
     }
     r->msg_written = ((u32)task_id << 16) | opcode;
 
-    c985_write_bar1(dev, C985_TO_ARM_PARAM0, param0);
-    if (opcode == 0x11 || opcode == 0x06 || opcode == 0x01 ||
-        opcode == 0x12 || opcode == 0x09 || opcode == 0x10 ||
-        opcode == 0x30 || opcode == 0x81 || opcode == 0x90 ||
-        opcode == 0xA0 || opcode == 0xA1) {
-        static const u16 slot_off[ARRAY_SIZE(dev->mbox_slots)] = {
-            0x6F4, 0x6F0, 0x6EC, 0x6E8, 0x6E4,
-            0x6E0, 0x6DC, 0x6D8, 0x6D4, 0x6D0,
-        };
-        int i;
+    if (!bare) {
+        c985_write_bar1(dev, C985_TO_ARM_PARAM0, param0);
+        if (opcode == 0x11 || opcode == 0x06 || opcode == 0x01 ||
+            opcode == 0x12 || opcode == 0x09 || opcode == 0x10 ||
+            opcode == 0x30 || opcode == 0x81 || opcode == 0x90 ||
+            opcode == 0xA0 || opcode == 0xA1) {
+            static const u16 slot_off[ARRAY_SIZE(dev->mbox_slots)] = {
+                0x6F4, 0x6F0, 0x6EC, 0x6E8, 0x6E4,
+                0x6E0, 0x6DC, 0x6D8, 0x6D4, 0x6D0,
+            };
+            int i;
 
-        for (i = 0; i < ARRAY_SIZE(slot_off); i++)
-            c985_write_bar1(dev, slot_off[i], dev->mbox_slots[i]);
-        wmb();
+            for (i = 0; i < ARRAY_SIZE(slot_off); i++)
+                c985_write_bar1(dev, slot_off[i], dev->mbox_slots[i]);
+            wmb();
+        }
     }
     wmb();
     c985_mbox_post(dev, r->status_sent, r->msg_written);
@@ -245,7 +249,7 @@ void c985_mbox_release_last(struct c985_dev *dev)
     dev->mbox_slots[2] = pts_valid;  /* 0x6EC */
     dev->mbox_slots[4] = ring_idx;   /* 0x6E4 (slot3 0x6E8 left 0) */
 
-    c985_mbox_send_polling(dev, 0x30, tag, r->task_id, false, 200);
+    c985_mbox_send_polling(dev, 0x30, tag, r->task_id, false, false, 200);
 
     memcpy(dev->mbox_slots, saved, sizeof(saved));
     dev->releasing = false;

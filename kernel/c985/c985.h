@@ -317,7 +317,7 @@ int c985_firmware_load(struct c985_dev *dev);
 
 /* Mailbox */
 int c985_mbox_send_polling(struct c985_dev *dev, u16 opcode, u32 param,
-                           u8 task_id, bool has_resp,
+                           u8 task_id, bool has_resp, bool bare,
                            unsigned long timeout_ms);
 int c985_mbox_drain(struct c985_dev *dev);
 int c985_mbox_wait_and_read(struct c985_dev *dev, unsigned long timeout_ms);
