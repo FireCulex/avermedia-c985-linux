@@ -33,6 +33,7 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev->pdev = pdev;
     dev->auto_release = auto_release;
     mutex_init(&dev->lock);
+    mutex_init(&dev->dma_read_lock);
     mutex_init(&dev->frame_lock);
     spin_lock_init(&dev->irq_lock);
     init_waitqueue_head(&dev->doorbell_wq);
@@ -155,6 +156,9 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     /* v4l2/vb2 capture device */
     c985_v4l2_init(dev);
 
+    /* ALSA audio capture device */
+    c985_audio_init(dev);
+
     pci_set_drvdata(pdev, dev);
 
     dev_info(&pdev->dev, "Probe successful, IRQ=%d, MSI=%d, MSI-X=%d\n",
@@ -179,6 +183,7 @@ void c985_remove(struct pci_dev *pdev)
         return;
 
     c985_quiesce(dev);
+    c985_audio_cleanup(dev);
     c985_v4l2_cleanup(dev);
     c985_debugfs_cleanup(dev);
 

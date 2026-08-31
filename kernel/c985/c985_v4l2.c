@@ -148,6 +148,23 @@ static int c985_v4l2_thread(void *data)
             continue;
         }
 
+        /* Route audio-task (taskId 1) descriptors to the audio consumer. */
+        if (((r->from_arm_msg >> 16) & 0xFF) == C985_AUD_TASK) {
+            struct c985_frame_desc ad;
+            ad.tag = r->resp_params[0] & 0xFFFF;
+            ad.ring_idx = (r->resp_params[0] >> 24) & 0xFF;
+            ad.y_dw = r->resp_params[1];
+            ad.u_dw = r->resp_params[2];
+            ad.chroma = r->resp_params[3];
+            ad.pts_raw = r->resp_params[4];
+            ad.task = C985_AUD_TASK;
+            ad.valid = true;
+            if (dev->audio_consumer)
+                dev->audio_consumer(dev, &ad);
+            c985_mbox_release_last(dev);
+            continue;
+        }
+
         d.tag = r->resp_params[0] & 0xFFFF;
         d.ring_idx = (r->resp_params[0] >> 24) & 0xFF;
         d.y_dw = r->resp_params[1];
@@ -243,6 +260,11 @@ static int c985_start_streaming(struct vb2_queue *q, unsigned int count)
         return ret;
     }
 
+    /* Boot the audio task (taskId 1) in lockstep. Best-effort: audio may
+     * be unavailable (no audio firmware / no signal); don't fail video. */
+    if (dev->audio_priv)
+        c985_audio_boot(dev);
+
     /* Reset the mailbox wait state (doorbell may be stale from boot). */
     dev->doorbell_pending = false;
 
@@ -277,6 +299,10 @@ static void c985_stop_streaming(struct vb2_queue *q)
     /* Stop encoder (0x02), drop 0x40 traffic (fw run-flag clear). */
     c985_v4l2_stop_encoder(dev);
 
+    /* Stop audio task in lockstep. */
+    if (dev->audio_priv)
+        c985_audio_stop(dev);
+
     /* Return all still-queued buffers. */
     list_for_each_entry_safe(buf, tmp, &c->ready, list) {
         list_del(&buf->list);
@@ -286,6 +312,8 @@ static void c985_stop_streaming(struct vb2_queue *q)
 
     /* Halt ARM to fully quiesce. */
     c985_v4l2_teardown(dev);
+    if (dev->audio_priv)
+        c985_audio_teardown(dev);
 }
 
 /* ---- Format / queue ioctls ---- */
@@ -426,8 +454,8 @@ static const struct vb2_ops c985_vb2_ops = {
 
 /* ---- Encoder boot chain (raw-profile, verified vs AVerPL33_x64.sys) ----
  * F1 SystemOpen -> F2 SystemLink -> six 0x10 setparams -> 0x01 StartEncoder
- * with the raw-mode config block. All silent (no completion wait), task 0. */
-#define C985_ENC_TASK 0
+ * with the raw-mode config block. All silent (no completion wait).
+ * task_id selects video (0) or audio (1); params are task-specific. */
 
 struct c985_enc_step {
     u16 opcode;
@@ -437,16 +465,16 @@ struct c985_enc_step {
     int nslots;
 };
 
-static int c985_enc_send(struct c985_dev *dev, u16 opcode, u32 param0,
-                         unsigned long to, const u32 *slots, int nslots,
-                         bool bare)
+static int c985_enc_send(struct c985_dev *dev, u8 task_id, u16 opcode,
+                         u32 param0, unsigned long to, const u32 *slots,
+                         int nslots, bool bare)
 {
     int i;
 
     for (i = 0; i < ARRAY_SIZE(dev->mbox_slots); i++)
         dev->mbox_slots[i] = (i < nslots) ? slots[i] : 0;
 
-    return c985_mbox_send_polling(dev, opcode, param0, C985_ENC_TASK,
+    return c985_mbox_send_polling(dev, opcode, param0, task_id,
                                   false, bare, to);
 }
 
@@ -454,9 +482,8 @@ static int c985_enc_send(struct c985_dev *dev, u16 opcode, u32 param0,
  * matching Windows CQLCodec_UpdateEncoderConfig's QPFWENCAPI_Set* burst
  * (each setter is a bare RegisterWrite, no mailbox message). The subsequent
  * UpdateConfig 0x06 commits this burst to firmware. */
-#define C985_ENC_CFG_REGS 11     /* 0x6F8 .. 0x6D0 inclusive */
 
-static void c985_enc_write_config(struct c985_dev *dev, const u32 *cfg)
+void c985_enc_write_config(struct c985_dev *dev, const u32 *cfg)
 {
     int i;
 
@@ -489,9 +516,9 @@ int c985_v4l2_boot_encoder(struct c985_dev *dev)
     int i, ret;
 
     for (i = 0; i < ARRAY_SIZE(steps); i++) {
-        ret = c985_enc_send(dev, steps[i].opcode, steps[i].param0,
-                            steps[i].timeout_ms, steps[i].slots,
-                            steps[i].nslots, false);
+        ret = c985_enc_send(dev, C985_ENC_TASK, steps[i].opcode,
+                            steps[i].param0, steps[i].timeout_ms,
+                            steps[i].slots, steps[i].nslots, false);
         if (ret && ret != -ETIMEDOUT) {
             dev_err(&dev->pdev->dev, "boot step 0x%02x failed: %d\n",
                     steps[i].opcode, ret);
@@ -503,18 +530,20 @@ int c985_v4l2_boot_encoder(struct c985_dev *dev)
      * with UpdateConfig 0x06 (bare), then bare StartEncoder 0x01. */
     c985_enc_write_config(dev, cfg);
 
-    ret = c985_enc_send(dev, 0x06, C985_ENC_TASK, 300, NULL, 0, true);
+    ret = c985_enc_send(dev, C985_ENC_TASK, 0x06, C985_ENC_TASK, 300,
+                        NULL, 0, true);
     if (ret && ret != -ETIMEDOUT)
         return ret;
 
-    return c985_enc_send(dev, 0x01, C985_ENC_TASK, 300, NULL, 0, true);
+    return c985_enc_send(dev, C985_ENC_TASK, 0x01, C985_ENC_TASK, 300,
+                         NULL, 0, true);
 }
 
 void c985_v4l2_stop_encoder(struct c985_dev *dev)
 {
     /* 0x02 StopEncoder (bStopAtGOP=0). Clears the task run-flag so the
      * firmware DTM drops subsequent 0x40 traffic. */
-    c985_enc_send(dev, 0x02, 0, 500, NULL, 0, false);
+    c985_enc_send(dev, C985_ENC_TASK, 0x02, 0, 500, NULL, 0, false);
 }
 
 void c985_v4l2_teardown(struct c985_dev *dev)
@@ -522,7 +551,7 @@ void c985_v4l2_teardown(struct c985_dev *dev)
     /* 0xF3 SystemClose full session teardown.
      * No ARM halt: keep firmware booted so a subsequent stream-open can
      * re-issue F1/F2 without a full re-upload. */
-    c985_enc_send(dev, 0xF3, 0, 500, NULL, 0, false);
+    c985_enc_send(dev, C985_ENC_TASK, 0xF3, 0, 500, NULL, 0, false);
     msleep(100);
 }
 

@@ -433,8 +433,8 @@ void c985_mbox_isr_service(struct c985_dev *dev)
         }
     }
 
-    /* Only 0x40 (EncDataOutReq frame-done) feeds the frame FIFO. */
-    if ((msg & 0xFF) != 0x40)
+    /* Only 0x40/0x41 (EncDataOutReq frame-done) feeds the frame FIFO. */
+    if ((msg & 0xFF) != 0x40 && (msg & 0xFF) != 0x41)
         return;
 
     d.tag = p[0] & 0xFFFF;
@@ -443,14 +443,16 @@ void c985_mbox_isr_service(struct c985_dev *dev)
     d.u_dw = p[2];
     d.chroma = p[3];
     d.pts_raw = p[4];
+    d.task = (msg >> 16) & 0xFF;
     d.valid = true;
 
     if (c985_mbox_fifo_push(dev, &d))
         queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work);
 }
 
-/* Workqueue consumer: drain FIFO, hand each descriptor to the v4l2 layer's
- * frame_consumer (which builds frame ops + submits DMA). */
+/* Workqueue consumer: drain FIFO, hand each descriptor to the appropriate
+ * layer. taskId 0 = video (frame_consumer), taskId 1 = audio
+ * (audio_consumer). */
 void c985_mbox_drain_work_fn(struct work_struct *w)
 {
     struct c985_dev *dev = container_of(w, struct c985_dev, mbox_drain_work);
@@ -459,6 +461,14 @@ void c985_mbox_drain_work_fn(struct work_struct *w)
     while (c985_mbox_fifo_pop(dev, &d)) {
         if (!d.valid)
             continue;
+        if (d.task == C985_AUD_TASK) {
+            if (dev->audio_consumer)
+                dev->audio_consumer(dev, &d);
+            else
+                dev_warn_ratelimited(&dev->pdev->dev,
+                    "0x40 audio frame dropped: no audio_consumer registered\n");
+            continue;
+        }
         if (dev->frame_consumer)
             dev->frame_consumer(dev, &d);
         else

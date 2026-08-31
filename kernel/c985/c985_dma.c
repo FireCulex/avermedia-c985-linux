@@ -214,11 +214,13 @@ int c985_dma_read_linear(struct c985_dev *dev, u32 card_addr,
     const u32 chunk = 0x100000;
     int ret;
 
+    mutex_lock(&dev->dma_read_lock);
+
     /* Upload path only ever rings the write channel */
     if (!dev->dma_chans[dev->dma_read_chan].desc_ring) {
         ret = c985_dma_alloc_desc(dev, dev->dma_read_chan, 2);
         if (ret)
-            return ret;
+            goto out;
     }
 
     while (len) {
@@ -228,16 +230,19 @@ int c985_dma_read_linear(struct c985_dev *dev, u32 card_addr,
         ret = c985_dma_submit(dev, dev->dma_read_chan, host_phys,
                               card_addr, n, false);
         if (ret)
-            return ret;
+            goto out;
         ret = c985_dma_wait(dev, dev->dma_read_chan, 3000);
         if (ret)
-            return ret;
+            goto out;
 
         card_addr += n;
         host_phys += n;
         len -= n;
     }
-    return 0;
+    ret = 0;
+out:
+    mutex_unlock(&dev->dma_read_lock);
+    return ret;
 }
 
 /* --- Async frame-mode DMA: submit one plane WITHOUT waiting ---
@@ -311,15 +316,21 @@ int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
     u64 offex;
     int ret;
 
-    if (!chan->in_use)
-        return -EINVAL;
+    mutex_lock(&dev->dma_read_lock);
+
+    if (!chan->in_use) {
+        ret = -EINVAL;
+        goto out;
+    }
     if (!chan->desc_ring) {
         ret = c985_dma_alloc_desc(dev, dev->dma_read_chan, 2);
         if (ret)
-            return ret;
+            goto out;
     }
-    if (ioread32(chan->regs + C985_DMA_REG_CTRL) & C985_DMA_STATUS_BUSY)
-        return -EBUSY;
+    if (ioread32(chan->regs + C985_DMA_REG_CTRL) & C985_DMA_STATUS_BUSY) {
+        ret = -EBUSY;
+        goto out;
+    }
 
     if ((ioread32(dev->bar0 + C985_DMA_GLOBAL_BASE + C985_DMA_GLOBAL_CTRL) & 1) == 0)
         iowrite32(1, dev->bar0 + C985_DMA_GLOBAL_BASE + C985_DMA_GLOBAL_CTRL);
@@ -344,7 +355,10 @@ int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
     iowrite32(upper_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_HI);
     iowrite32(C985_DMA_CTRL_START, chan->regs + C985_DMA_REG_CTRL);
 
-    return c985_dma_wait(dev, dev->dma_read_chan, 3000);
+    ret = c985_dma_wait(dev, dev->dma_read_chan, 3000);
+out:
+    mutex_unlock(&dev->dma_read_lock);
+    return ret;
 }
 
 /* --- Async full-frame DMA (Y -> U -> V serial, Windows model) ---

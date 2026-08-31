@@ -82,6 +82,33 @@
 #define FW_VIDEO_SIZE           353236
 #define FW_AUDIO_SIZE           362776
 
+/* Encoder task IDs (upper 16 bits of 0x6FC/0x6CC/0x6B0). task0 = video,
+ * task1 = audio. Verified against live dbgview.log + AVerPL33_x64.sys. */
+#define C985_ENC_TASK           0
+#define C985_AUD_TASK           1
+
+/* Encoder function IDs (0x6F8 param for SystemOpen F1). */
+#define C985_FUNC_VIDEO         0x80000004
+#define C985_FUNC_AUDIO         0x80000040
+
+/* Frame descriptor dataType tags (p1 & 0xffff). Raw outputs only. */
+#define C985_DT_RAW_VIDEO       0x81
+#define C985_DT_RAW_AUDIO       0x82
+
+/* Encoder config register burst width: 0x6F8 .. 0x6D0 inclusive. */
+#define C985_ENC_CFG_REGS       11
+
+/*
+ * Audio capture via the compressed path (live OBS ground truth): the card
+ * records AAC-LC @48kHz/128kbps/stereo natively (product spec MPEG4
+ * H.264+AAC). Audio frames arrive on the SAME 0x40/0x41 EncDataOutReq
+ * descriptor as video, tagged taskId=1 in the upper 16 bits of 0x6B0, and
+ * are DMA-read LINEARLY (ctrl 0x0804200F, w=0 h=0) in 1536/3072/4608-byte
+ * chunks. Raw PCM (RawAudOutput 0x82, ARM_BUF_OTHERS) uses the separate
+ * 0xC0 descriptor with 0xA0/0xA1 reply instead.
+ */
+#define C985_AUDIO_FRAME_MAX    8192    /* generous: AAC frames are <=4608 */
+
 /* Frame readback cap (debugfs frame_read) */
 #define C985_FRAME_MAX          (8u * 1024u * 1024u)
 
@@ -128,12 +155,13 @@ struct c985_mbox_result {
  *   p3 = chroma_size_bytes; p4 = PTS (bit31 = pts-valid)
  */
 struct c985_frame_desc {
-    u32 tag;        /* p0 low bits (0x81 = raw YUV) */
+    u32 tag;        /* p0 low bits (0x81 = raw YUV, 0x82 = raw audio) */
     u32 ring_idx;   /* p0 >> 24 */
-    u32 y_dw;       /* p1: Y plane card address in DWORDs */
+    u32 y_dw;       /* p1: Y plane / audio buffer card address in DWORDs */
     u32 u_dw;       /* p2: UV plane card address in DWORDs */
-    u32 chroma;     /* p3: chroma plane size in bytes */
+    u32 chroma;     /* p3: chroma plane size / audio buffer size in bytes */
     u32 pts_raw;    /* p4: PTS, bit31 = pts-valid */
+    u8  task;       /* taskId from 0x6B0 upper 16 bits (0 video / 1 audio) */
     bool valid;
 };
 
@@ -197,6 +225,7 @@ struct c985_frame_fifo {
 struct c985_dev {
     struct pci_dev *pdev;
     struct mutex lock;
+    struct mutex dma_read_lock;   /* serializes the single C2S (read) channel */
     spinlock_t irq_lock;
 
     void __iomem *bar0;  /* DMA/PCIe */
@@ -263,6 +292,14 @@ struct c985_dev {
      * 0x40 descriptor. Set by the v4l2 layer (Phase 3/4). */
     void (*frame_consumer)(struct c985_dev *dev, struct c985_frame_desc *d);
     void *v4l2_priv;    /* opaque c985_v4l2 state (allocated on demand) */
+
+    /* Audio consumer hook: called from mbox drain work with each popped
+     * 0x40/0x41 descriptor whose taskId==C985_AUD_TASK. The audio layer
+     * DMA-reads the (compressed AAC) buffer linearly and feeds ALSA.
+     * Descriptor fields reused: y_dw = buffer addr (dwords), chroma = size
+     * (bytes). Set by the audio (c985_audio) layer. */
+    void (*audio_consumer)(struct c985_dev *dev, struct c985_frame_desc *d);
+    void *audio_priv;   /* opaque c985_audio state (allocated on demand) */
 
     /* CPR peek (debugfs) */
     u32 cpr_peek_addr;
@@ -356,6 +393,14 @@ void c985_v4l2_cleanup(struct c985_dev *dev);
 int c985_v4l2_boot_encoder(struct c985_dev *dev);
 void c985_v4l2_stop_encoder(struct c985_dev *dev);
 void c985_v4l2_teardown(struct c985_dev *dev);
+void c985_enc_write_config(struct c985_dev *dev, const u32 *cfg);
+
+/* ALSA audio capture device (Phase: audio) */
+int c985_audio_init(struct c985_dev *dev);
+void c985_audio_cleanup(struct c985_dev *dev);
+int c985_audio_boot(struct c985_dev *dev);
+void c985_audio_stop(struct c985_dev *dev);
+void c985_audio_teardown(struct c985_dev *dev);
 
 /* Inline register access */
 static inline u32 c985_read_bar0(struct c985_dev *dev, u32 offset)
