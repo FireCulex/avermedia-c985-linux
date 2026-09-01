@@ -64,15 +64,21 @@ static void c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
         return;
     }
 
-    if (d->y_dw == 0 || d->chroma == 0 || d->chroma > a->dma_size) {
-        dev_dbg(&dev->pdev->dev, "audio: bad desc addr=0x%x size=%u\n",
+    /* Class-4 (compressed audio) descriptor: addr = y_dw (DWORDS -> <<2 for
+     * bytes), size = chroma field in DWORDS (firmware reserved3), so -> <<2
+     * for byte length. Verified against the Windows class-4 record build
+     * (addrDWORDS=0x6B8, sizeDWORDS=0x6C0). */
+    u32 bytes = d->chroma << 2;
+
+    if (d->y_dw == 0 || d->chroma == 0 || bytes > a->dma_size) {
+        dev_dbg(&dev->pdev->dev, "audio: bad desc addr=0x%x size_dw=%u\n",
                 d->y_dw, d->chroma);
         atomic64_inc(&a->frames_dropped);
         return;
     }
 
-    /* Linear read (no frame geometry): card buffer addr << 2, size = chroma. */
-    n = c985_dma_read_linear(dev, d->y_dw << 2, a->dma_phys, d->chroma);
+    /* Linear read (no frame geometry): card buffer addr << 2, size = bytes. */
+    n = c985_dma_read_linear(dev, d->y_dw << 2, a->dma_phys, bytes);
     if (n < 0) {
         dev_dbg(&dev->pdev->dev, "audio: DMA read failed: %d\n", n);
         atomic64_inc(&a->frames_dropped);
@@ -80,20 +86,20 @@ static void c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
     }
 
     mutex_lock(&a->lock);
-    if (kfifo_in(&a->fifo, a->dma_buf, d->chroma) < d->chroma)
+    if (kfifo_in(&a->fifo, a->dma_buf, bytes) < bytes)
         atomic64_inc(&a->frames_dropped);
     mutex_unlock(&a->lock);
 
     atomic64_inc(&a->frames_done);
-    atomic64_add(d->chroma, &a->bytes_done);
+    atomic64_add(bytes, &a->bytes_done);
     wake_up_all(&a->wq);
 }
 
 /* ---- ALSA PCM capture callbacks ---- */
 
 static struct snd_pcm_hardware c985_audio_hw = {
-    .info = 0,
-    .formats = SNDRV_PCM_FMTBIT_MPEG,
+    .info = SNDRV_PCM_INFO_INTERLEAVED,
+    .formats = SNDRV_PCM_FMTBIT_S16_LE,
     .rates = SNDRV_PCM_RATE_48000,
     .rate_min = 48000,
     .rate_max = 48000,
@@ -106,6 +112,15 @@ static struct snd_pcm_hardware c985_audio_hw = {
     .periods_max = 1024,
 };
 
+/*
+ * AAC-LC passthrough: the firmware emits compressed AAC, but ALSA cannot
+ * negotiate a zero-width compressed format (MPEG is filtered out in
+ * snd_pcm_hw_rule_format). We therefore expose S16_LE as an opaque BYTE
+ * transport: the interleaved 2ch framing is ignored by userspace, which
+ * decodes the raw AAC bitstream itself (ffmpeg -f alsa -> -f adts). The
+ * kfifo carries raw AAC bytes; period/buffer math is still well-defined
+ * because S16_LE has a real 16-bit width.
+ */
 static int c985_audio_pcm_open(struct snd_pcm_substream *substream)
 {
     struct c985_audio *a = substream->pcm->private_data;
@@ -223,11 +238,9 @@ int c985_audio_boot(struct c985_dev *dev)
     struct c985_audio *a = dev->audio_priv;
     static const struct { u16 opcode; u32 param0; u32 slots[3]; int nslots; } steps[] = {
         { 0xF1, C985_FUNC_AUDIO, { 0 }, 0 },
-        { 0xF2, 0x10000108,     { 0 }, 0 },
-        { 0x10, 0x10,           { 0, 0 }, 2 },
-        { 0x10, 0x12,           { 0, 0, 0 }, 3 },
-        { 0x10, 0x13,           { 0x50, 0, 0xa }, 3 },
-        { 0x10, 0x14,           { 0x1, 0x4a38 }, 2 },
+        { 0xF2, 0x00010000,     { 0 }, 0 },
+        { 0x10, 0x0F,           { 0, 0 }, 2 },
+        { 0x10, 0x10,           { 0, 0, 0 }, 3 },
         { 0x10, 0x02,           { 0xf1f1f1da, 0xb6f1f1b6 }, 2 },
     };
     /* Audio encoder descriptor block (0x6F8..0x6D0), live-trace verified. */

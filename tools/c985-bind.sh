@@ -71,6 +71,16 @@ case "${1:-}" in
   bind)
     # The c985 module IS a v4l2 capture device now; no loopback needed.
 
+    # Refuse to proceed if a live module is wedged (nonzero refcount from
+    # D-state holders that a pkill can't reap). rmmod would hang forever.
+    if lsmod | grep -q "^c985 "; then
+        live_refcnt=$(cat /sys/module/c985/refcnt 2>/dev/null || echo 0)
+        if [ "$live_refcnt" != "0" ]; then
+            echo "bind: c985 is loaded with refcnt=$live_refcnt (in use / deadlocked); reboot required." >&2
+            exit 1
+        fi
+    fi
+
     # Load videobuf2/v4l2 dependencies (in-kernel driver is a v4l2 capture
     # device now; insmod cannot resolve these symbol deps by itself)
     for m in videobuf2-common videobuf2-memops videobuf2-dma-contig videobuf2-v4l2; do
@@ -140,6 +150,11 @@ case "${1:-}" in
     ;;
   unbind)
     kill_video_holders
+
+    if [ "$(cat /sys/module/c985/refcnt 2>/dev/null)" != "0" ]; then
+        echo "unbind: c985 has nonzero refcount (live users present); refusing to force-unload. Kill holders / reboot." >&2
+        exit 1
+    fi
 
     if [ -L "$DRV/$PCI_ID" ]; then
         swrite "$DRV/unbind" "$PCI_ID"

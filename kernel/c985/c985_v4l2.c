@@ -178,7 +178,17 @@ static int c985_v4l2_thread(void *data)
             continue;
         }
 
-        mutex_lock(&c->q_lock);
+        /* Re-check stop before touching q_lock; stop_streaming holds q_lock
+         * while joining us, so a blocking lock here would deadlock. */
+        if (kthread_should_stop() || READ_ONCE(c->thread_stop))
+            break;
+
+        /* Interruptible: kthread_stop() (during stop_streaming, which holds
+         * q_lock) signals the thread; a plain mutex_lock would deadlock
+         * against stop_streaming -> kthread_stop waiting for us while we
+         * wait on q_lock. */
+        if (mutex_lock_interruptible(&c->q_lock))
+            break;
         buf = c985_v4l2_next_buf(c);
         mutex_unlock(&c->q_lock);
         if (!buf) {
