@@ -36,6 +36,22 @@ swrite() {
     echo "$content" > "$file" 2>/dev/null || true
 }
 
+# Run systemctl --user as the actual user (not root)
+# SUDO_USER is set when script is run via sudo.
+# Must propagate XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS so the root
+# shell can reach the target user's systemd session bus (otherwise
+# systemctl --user silently does nothing and audio never comes back).
+user_systemctl() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        sudo -u "$SUDO_USER" \
+            XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u "$SUDO_USER")/bus" \
+            systemctl --user "$@" 2>/dev/null || true
+    else
+        systemctl --user "$@" 2>/dev/null || true
+    fi
+}
+
 # Kill stragglers holding a stale /dev/video* fd: a dead fd pins the
 # module refcount and makes rmmod fail with "Module c985 is in use",
 # which then makes the NEXT bind skip insmod and reuse the stale .ko.
@@ -46,6 +62,29 @@ kill_video_holders() {
             case "$(readlink "$fd" 2>/dev/null)" in
                 */dev/video*)
                     echo "unbind: killing PID $pid ($(cat /proc/$pid/comm 2>/dev/null)) holding $fd" >&2
+                    kill "$pid" 2>/dev/null || true
+                    break
+                    ;;
+            esac
+        done
+    done
+}
+
+# Kill stragglers holding ALSA devices for the c985 audio card (control/PCM).
+# WirePlumber/PipeWire holds /dev/snd/controlC* and /dev/snd/pcmC*D*c open,
+# which keeps the c985 module refcount nonzero via snd_pcm dependency.
+kill_alsa_holders() {
+    # Find c985 ALSA card index from /proc/asound/cards
+    card_idx=$(awk '/c985/ { gsub(/\[|\]/, "", $1); print $1 }' /proc/asound/cards 2>/dev/null | head -1)
+    [ -z "$card_idx" ] && return 0
+
+    for pid in /proc/[0-9]*; do
+        pid=${pid#/proc/}
+        for fd in /proc/$pid/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+                /dev/snd/controlC"$card_idx"|/dev/snd/pcmC"$card_idx"D*c)
+                    echo "unbind: killing PID $pid ($(cat /proc/$pid/comm 2>/dev/null)) holding $target" >&2
                     kill "$pid" 2>/dev/null || true
                     break
                     ;;
@@ -150,8 +189,9 @@ case "${1:-}" in
     ;;
   unbind)
     kill_video_holders
+    kill_alsa_holders
 
-    if [ "$(cat /sys/module/c985/refcnt 2>/dev/null)" != "0" ]; then
+    if [ "$(cat /sys/module/c985/refcnt 2>/dev/null || echo 0)" != "0" ]; then
         echo "unbind: c985 has nonzero refcount (live users present); refusing to force-unload. Kill holders / reboot." >&2
         exit 1
     fi
@@ -165,6 +205,24 @@ case "${1:-}" in
         sleep 0.2
     done
     rmmod v4l2loopback 2>/dev/null || true
+
+    # Restart user PipeWire/WirePlumber stack so audio works again.
+    # WirePlumber is a session manager layered on top of pipewire, so bring
+    # pipewire up first and let wireplumber follow (avoids WP exiting because
+    # its pipewire dependency wasn't ready yet).
+    # stop + start handles both the "killed" and "still active" cases
+    # (restart fails if the unit is already dead, start fails if it's active).
+    for svc in pipewire pipewire-pulse wireplumber; do
+        user_systemctl stop "$svc"
+        sleep 0.3
+        user_systemctl start "$svc"
+    done
+
+    # Wait for wireplumber to be fully active (max 5 seconds)
+    for i in 1 2 3 4 5; do
+        user_systemctl is-active --quiet wireplumber && break
+        sleep 1
+    done
     ;;
   status)
     if [ -L "$DRV/$PCI_ID" ]; then
