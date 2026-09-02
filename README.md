@@ -2,7 +2,7 @@
 
 Linux V4L2 driver for the AVerMedia C985 (1af2:a001), implementing support for the card's vendor-specific mailbox-based firmware protocol, reverse-engineered from the Windows driver and ARM firmware.
 
-**Video capture: working** | **Audio capture: not working**
+**Video capture: working** | **Audio capture: working (AAC-LC passthrough via ALSA PCM)**
 
 ![OBS Capture](https://i.imgur.com/TRJMRWp.png)
 
@@ -89,6 +89,27 @@ Override kernel module path: `C985_KO=/path/to/c985.ko sudo ./tools/c985-bind.sh
 
 Override PCI ID: `C985_PCI_ID=0000:01:00.0 sudo ./tools/c985-bind.sh bind`
 
+## Audio Capture
+
+The driver registers an ALSA capture device (`c985-audio`) delivering raw AAC-LC frames (48 kHz, stereo, ~128 kbps). The format is exposed as `S16_LE` (opaque byte transport); userspace decodes the bitstream.
+
+```bash
+# List audio devices
+arecord -l
+
+# Capture raw AAC to file (card index varies, check arecord -l)
+arecord -D hw:C985 -f S16_LE -c 2 -r 48000 -t raw audio.aac
+
+# Play back with ffmpeg (decode AAC on the fly)
+ffmpeg -f alsa -i hw:C985 -f adts - | ffplay -f adts -
+
+# Or save as ADTS and play
+ffmpeg -f alsa -i hw:C985 -c copy audio.adts
+ffplay audio.adts
+```
+
+**Note:** The ALSA device appears after `c985_audio_boot()` runs (triggered by opening the video device for streaming). Open `/dev/video0` first (e.g., `v4l2-ctl --stream-mmap=3 --stream-to=/dev/null`), then the audio device will be active.
+
 ## Running Tests
 
 ```bash
@@ -133,7 +154,7 @@ When loaded, the driver exposes debugfs at `/sys/kernel/debug/c985/`:
 PCIe → BAR0 (DMA) / BAR1 (Mailbox/ARM) → Firmware (QPSOS) → v4l2 → /dev/video0
 ```
 
-**Kernel module** (`kernel/c985/`, 9 source files):
+**Kernel module** (`kernel/c985/`, 10 source files):
 
 | File | Purpose |
 |------|---------|
@@ -143,6 +164,7 @@ PCIe → BAR0 (DMA) / BAR1 (Mailbox/ARM) → Firmware (QPSOS) → v4l2 → /dev/
 | `c985_mbox.c` | Mailbox command/response + interrupt-driven frame FIFO |
 | `c985_irq.c` | MSI/MSI-X, PCIe/HCI/doorbell interrupt handling |
 | `c985_fw.c` | QPSOS firmware load (video + audio) |
+| `c985_audio.c` | ALSA PCM capture (AAC-LC passthrough) |
 | `c985_nuc100.c` | CPR register access for NUC100 sensor config |
 | `c985_debugfs.c` | Debugfs knobs |
 | `cpr.c` | CPR register helpers |
@@ -153,9 +175,10 @@ PCIe → BAR0 (DMA) / BAR1 (Mailbox/ARM) → Firmware (QPSOS) → v4l2 → /dev/
 
 ## Known Limitations
 
-- **Audio capture not implemented** — firmware loads but no ALSA/V4L2 audio path
 - No support for other AVerMedia models
 - Requires Clang/LLVM for build
+- Audio capture exposes raw AAC frames; userspace must decode (e.g., ffmpeg `-f alsa -i hw:X -f adts - | ffplay -f adts -`)
+- **UNRESOLVED DMA FRAGMENTATION BUG**: Video capture intermittently fails with "dma alloc of size 3112960 failed" (order-10 DMA32). Root cause: 4 vb2 buffers × 3.1MB contiguous = 12.4MB DMA32 needed; memory fragmentation leaves zero 4MB contiguous blocks. **Reducing buffer count to 2 breaks capture** (firmware needs 4-slot ring). OBS only supports packed `V4L2_PIX_FMT_YUV420` (YU12), not multi-planar `YUV420M` — multi-planar workaround blocked; scatter-gather (vb2_dma_sg with chained 4KB descriptors) remains viable but requires DMA path rewrite. See `c985_v4l2.c:243` `c985_queue_setup()`.
 
 ## Common Gotchas
 
