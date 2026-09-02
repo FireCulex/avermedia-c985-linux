@@ -98,13 +98,13 @@ static void c985_v4l2_render_and_done(struct c985_v4l2 *c,
         goto out;
     }
     if (c985_dma_read_frame_mode(dev, d->u_dw << 2, base + C985_Y_LEN,
-                                 C985_C_LEN, C985_WIDTH, true)) {
+                                 C985_C_LEN, C985_WIDTH / 2, true)) {
         rc = -1;
         goto out;
     }
     if (c985_dma_read_frame_mode(dev, (d->u_dw << 2) + C985_V_OFFSET_BYTES,
                                  base + C985_Y_LEN + C985_C_LEN,
-                                 C985_C_LEN, C985_WIDTH, true))
+                                 C985_C_LEN, C985_WIDTH / 2, true))
         rc = -1;
 
 out:

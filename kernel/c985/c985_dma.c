@@ -277,8 +277,11 @@ int c985_dma_read_frame_mode_submit(struct c985_dev *dev, u32 card_addr,
     reinit_completion(&chan->done);
 
     /* CardOffsetEx geometry IDENTICAL to the verified c985_dma_read_frame_mode
-     * path: byte[32-39] = width/32,
-     * byte[40-47] = 16 (Y) / 8 (chroma), byte[56+] = DataSwap 3. */
+     * path. `width` is the EFFECTIVE plane width: full luma width for Y, HALF
+     * (luma/2) for chroma. byte[32-39] = plane raster stride in 64-bit words
+     * = width/32 (Y -> 1920/32=60, chroma -> 960/32=30), so the stride for a
+     * chroma plane is half that of luma. byte[40-47] = 16 (Y) / 8 (chroma),
+     * byte[56+] = DataSwap 3. */
     offex = ((u64)(width / 32) << 32) |
             ((u64)(chroma ? 8 : 16) << 40) |
             ((u64)3 << 56);
@@ -337,6 +340,8 @@ int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
 
     reinit_completion(&chan->done);
 
+    /* `width` is the effective plane width (full luma for Y, luma/2 for
+     * chroma); see c985_dma_read_frame_mode_submit for field decode. */
     offex = ((u64)(width / 32) << 32) |
             ((u64)(chroma ? 8 : 16) << 40) |
             ((u64)3 << 56);
