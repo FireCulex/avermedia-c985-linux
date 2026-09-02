@@ -205,6 +205,22 @@ static int c985_v4l2_thread(void *data)
     return 0;
 }
 
+void c985_v4l2_get_stats(struct c985_dev *dev, struct c985_stream_stats *s)
+{
+    struct c985_v4l2 *c = dev->v4l2_priv;
+
+    if (!c) {
+        memset(s, 0, sizeof(*s));
+        return;
+    }
+    atomic64_set(&s->frames_done, atomic64_read(&c->frames_done));
+    atomic64_set(&s->frames_dropped, atomic64_read(&c->frames_dropped));
+    atomic64_set(&s->bytes_done, 0);
+    atomic64_set(&s->desc_non40, atomic64_read(&c->desc_non40));
+    atomic64_set(&s->desc_bad, atomic64_read(&c->desc_bad));
+    atomic64_set(&s->no_buf, atomic64_read(&c->no_buf));
+}
+
 /* ---- vb2 callbacks ---- */
 
 static int c985_queue_setup(struct vb2_queue *q,
@@ -223,7 +239,9 @@ static int c985_queue_setup(struct vb2_queue *q,
     *num_planes = nplanes;
     sizes[0] = C985_FRAME_BYTES;
 
-    /* 4 buffers matching the firmware's 4-slot card ring. */
+    /* 2 buffers minimum; driver's 16-entry frame FIFO decouples from firmware's 4-slot ring.
+     * 30fps = 33ms/frame; 2 buffers recycled every ~66ms feasible for DMA + userspace.
+     * Cap at 2 to avoid DMA32 contiguous allocation pressure (3.1MB/buffer). */
     if (*num_buffers < 4)
         *num_buffers = 4;
     if (*num_buffers > VIDEO_MAX_FRAME)

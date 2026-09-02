@@ -636,11 +636,51 @@ static const struct file_operations c985_debugfs_mbox_wait_fops = {
     .open = simple_open,
 };
 
+static int c985_debugfs_counters_show(struct seq_file *m, void *v)
+{
+    struct c985_dev *dev = m->private;
+    struct c985_stream_stats vs, as;
+
+    c985_v4l2_get_stats(dev, &vs);
+    c985_audio_get_stats(dev, &as);
+
+    seq_printf(m, "=== video (v4l2) ===\n");
+    seq_printf(m, "frames_done:    %lld\n", (long long)atomic64_read(&vs.frames_done));
+    seq_printf(m, "frames_dropped: %lld\n", (long long)atomic64_read(&vs.frames_dropped));
+    seq_printf(m, "desc_non40:     %lld\n", (long long)atomic64_read(&vs.desc_non40));
+    seq_printf(m, "desc_bad:       %lld\n", (long long)atomic64_read(&vs.desc_bad));
+    seq_printf(m, "no_buf:         %lld\n", (long long)atomic64_read(&vs.no_buf));
+
+    seq_printf(m, "\n=== audio (alsa) ===\n");
+    seq_printf(m, "frames_done:    %lld\n", (long long)atomic64_read(&as.frames_done));
+    seq_printf(m, "frames_dropped: %lld\n", (long long)atomic64_read(&as.frames_dropped));
+    seq_printf(m, "bytes_done:     %lld\n", (long long)atomic64_read(&as.bytes_done));
+
+    seq_printf(m, "\n=== frame fifo ===\n");
+    seq_printf(m, "pushed: %d\n", atomic_read(&dev->frame_fifo.frames));
+    seq_printf(m, "overflow: %d\n", atomic_read(&dev->frame_fifo.overflow));
+    return 0;
+}
+
+static int c985_debugfs_counters_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, c985_debugfs_counters_show, inode->i_private);
+}
+
+static const struct file_operations c985_debugfs_counters_fops = {
+    .owner = THIS_MODULE,
+    .open = c985_debugfs_counters_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
 int c985_debugfs_init(struct c985_dev *dev)
 {
     dev->debugfs_dir = debugfs_create_dir("c985", NULL);
     if (dev->debugfs_dir) {
         debugfs_create_file("regs", 0444, dev->debugfs_dir, dev, &c985_debugfs_regs_fops);
+        debugfs_create_file("counters", 0444, dev->debugfs_dir, dev, &c985_debugfs_counters_fops);
         debugfs_create_file("write_reg", 0222, dev->debugfs_dir, dev, &c985_debugfs_write_fops);
         debugfs_create_file("read_reg", 0644, dev->debugfs_dir, dev, &c985_debugfs_read_reg_fops);
         debugfs_create_file("mbox_send", 0220, dev->debugfs_dir, dev, &c985_debugfs_mbox_fops);

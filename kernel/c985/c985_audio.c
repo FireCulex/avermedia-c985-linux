@@ -37,6 +37,7 @@ struct c985_audio {
 
     struct snd_card *card;
     struct snd_pcm *pcm;
+    struct snd_pcm_substream *substream;
 
     struct mutex lock;
     wait_queue_head_t wq;
@@ -50,6 +51,9 @@ struct c985_audio {
     atomic64_t frames_done;
     atomic64_t bytes_done;
     atomic64_t frames_dropped;   /* fifo full or no data */
+
+    unsigned long hw_ptr;        /* consumed buffer position (bytes), wraps */
+    unsigned long last_period;   /* last signaled period index */
 };
 
 /* ---- audio_consumer: called from mbox drain work for taskId==1 descs ---- */
@@ -57,6 +61,11 @@ struct c985_audio {
 static void c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
 {
     struct c985_audio *a = dev->audio_priv;
+    struct snd_pcm_substream *substream;
+    struct snd_pcm_runtime *runtime;
+    unsigned long buf_bytes, period_bytes;
+    u8 *dma_area;
+    unsigned long off;
     int n;
 
     if (!a || !a->running) {
@@ -85,11 +94,44 @@ static void c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
         return;
     }
 
+    substream = READ_ONCE(a->substream);
+    if (!substream || !substream->runtime)
+        goto fifo;
+
+    runtime = substream->runtime;
+    dma_area = runtime->dma_area;
+    buf_bytes = snd_pcm_lib_buffer_bytes(substream);
+    if (!dma_area || buf_bytes == 0)
+        goto fifo;
+
+    /* Write the frame into the ring at hw_ptr, wrapping; then advance and
+     * signal the ALSA core so its mmap/copy_user read completes. */
+    off = a->hw_ptr % buf_bytes;
+    if (off + bytes > buf_bytes) {
+        unsigned long first = buf_bytes - off;
+        memcpy(dma_area + off, a->dma_buf, first);
+        memcpy(dma_area, a->dma_buf + first, bytes - first);
+    } else {
+        memcpy(dma_area + off, a->dma_buf, bytes);
+    }
+    a->hw_ptr += bytes;
+
+    period_bytes = frames_to_bytes(runtime, runtime->period_size);
+    if (a->hw_ptr / period_bytes > a->last_period) {
+        a->last_period = a->hw_ptr / period_bytes;
+        snd_pcm_period_elapsed(substream);
+    }
+
+    atomic64_inc(&a->frames_done);
+    atomic64_add(bytes, &a->bytes_done);
+    wake_up_all(&a->wq);
+    return;
+
+fifo:
     mutex_lock(&a->lock);
     if (kfifo_in(&a->fifo, a->dma_buf, bytes) < bytes)
         atomic64_inc(&a->frames_dropped);
     mutex_unlock(&a->lock);
-
     atomic64_inc(&a->frames_done);
     atomic64_add(bytes, &a->bytes_done);
     wake_up_all(&a->wq);
@@ -124,27 +166,28 @@ static struct snd_pcm_hardware c985_audio_hw = {
 static int c985_audio_pcm_open(struct snd_pcm_substream *substream)
 {
     struct c985_audio *a = substream->pcm->private_data;
+    snd_pcm_set_sync(substream);
     substream->runtime->hw = c985_audio_hw;
-    substream->private_data = a;
+    a->substream = substream;
     return 0;
 }
 
 static int c985_audio_pcm_close(struct snd_pcm_substream *substream)
 {
-    (void)substream;
+    struct c985_audio *a = substream->pcm->private_data;
+    a->substream = NULL;
     return 0;
 }
 
 static int c985_audio_pcm_hw_params(struct snd_pcm_substream *substream,
                                     struct snd_pcm_hw_params *params)
 {
-    return snd_pcm_lib_malloc_pages(substream,
-                                    params_buffer_bytes(params));
+    return 0; /* managed buffer already set via snd_pcm_set_managed_buffer_all */
 }
 
 static int c985_audio_pcm_hw_free(struct snd_pcm_substream *substream)
 {
-    return snd_pcm_lib_free_pages(substream);
+    return 0;
 }
 
 static int c985_audio_pcm_prepare(struct snd_pcm_substream *substream)
@@ -152,6 +195,8 @@ static int c985_audio_pcm_prepare(struct snd_pcm_substream *substream)
     struct c985_audio *a = substream->pcm->private_data;
     mutex_lock(&a->lock);
     kfifo_reset(&a->fifo);
+    a->hw_ptr = 0;
+    a->last_period = 0;
     mutex_unlock(&a->lock);
     return 0;
 }
@@ -176,48 +221,9 @@ static int c985_audio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 static snd_pcm_uframes_t c985_audio_pcm_pointer(struct snd_pcm_substream *substream)
 {
     struct c985_audio *a = substream->pcm->private_data;
-    return bytes_to_frames(substream->runtime,
-                           (unsigned long)atomic64_read(&a->bytes_done));
-}
+    unsigned long buf_bytes = snd_pcm_lib_buffer_bytes(substream);
 
-static int c985_audio_pcm_copy(struct snd_pcm_substream *substream, int channel,
-                               unsigned long pos, struct iov_iter *iter,
-                               unsigned long count)
-{
-    struct c985_audio *a = substream->pcm->private_data;
-    u8 tmp[512];
-    size_t copied = 0;
-    int ret;
-
-    /* count is bytes for the compressed (MPEG) format; zero means done. */
-    if (count == 0)
-        return 0;
-
-    ret = wait_event_interruptible(a->wq,
-                                   kfifo_len(&a->fifo) > 0 || !a->running);
-    if (ret)
-        return ret;
-    if (!a->running && kfifo_len(&a->fifo) == 0)
-        return -ENODATA;
-
-    while (copied < count) {
-        unsigned int chunk = min_t(unsigned int, sizeof(tmp), count - copied);
-        unsigned int got;
-
-        mutex_lock(&a->lock);
-        got = kfifo_out(&a->fifo, tmp, chunk);
-        mutex_unlock(&a->lock);
-        if (got == 0)
-            break;
-
-        if (copy_to_iter(tmp, got, iter) != got) {
-            ret = -EFAULT;
-            return ret;
-        }
-        copied += got;
-    }
-
-    return copied;
+    return bytes_to_frames(substream->runtime, a->hw_ptr % buf_bytes);
 }
 
 static const struct snd_pcm_ops c985_audio_pcm_ops = {
@@ -228,7 +234,6 @@ static const struct snd_pcm_ops c985_audio_pcm_ops = {
     .prepare   = c985_audio_pcm_prepare,
     .trigger   = c985_audio_pcm_trigger,
     .pointer   = c985_audio_pcm_pointer,
-    .copy      = c985_audio_pcm_copy,
 };
 
 /* ---- audio task boot (taskId 1) ---- */
@@ -238,15 +243,24 @@ int c985_audio_boot(struct c985_dev *dev)
     struct c985_audio *a = dev->audio_priv;
     static const struct { u16 opcode; u32 param0; u32 slots[3]; int nslots; } steps[] = {
         { 0xF1, C985_FUNC_AUDIO, { 0 }, 0 },
-        { 0xF2, 0x00010000,     { 0 }, 0 },
+        { 0xF2, 0x1000108,      { 0 }, 0 },
         { 0x10, 0x0F,           { 0, 0 }, 2 },
         { 0x10, 0x10,           { 0, 0, 0 }, 3 },
+        { 0x10, 0x12,           { 0 }, 1 },
+        { 0x10, 0x13,           { 0x50, 0, 0xA }, 3 },
+        { 0x10, 0x14,           { 1, 0x4A38 }, 2 },
+        { 0x10, 0x04,           { 0, 0, 0 }, 3 },  /* SetAudioEnhancement (8 slots, first 3) */
         { 0x10, 0x02,           { 0xf1f1f1da, 0xb6f1f1b6 }, 2 },
     };
-    /* Audio encoder descriptor block (0x6F8..0x6D0), live-trace verified. */
-    u32 cfg[C985_ENC_CFG_REGS] = {
+    /* Audio encoder descriptor block (0x6F8..0x6D0), member order from
+     * dbgview.log QPFWENCAPI_Set* burst for taskId=1 (81.853s):
+     * SetSystemControl(0x6F8), SetPictureResolution(0x6F4), SetInputControl(0x6F0),
+     * SetRateControl(0x6EC), SetVBRBitRate(0x6E8), SetFilterControl(0x6E4),
+     * SetGOPLoopFilter(0x6E0), SetOutPicResolution(0x6DC), SetBlockSize(0x6D8),
+     * SetAudioControl(0x6D4), SetAudioControlEx(0x6D0). */
+u32 cfg[C985_ENC_CFG_REGS] = {
         0x2101b214, 0x04380780, 0x0f7c0609, 0x005003e8, 0x1f4007d0,
-        0x80002000, 0x6001000a, 0x10, 0x04380780, 0x01121080, 0x480,
+        0x80002000, 0x6001000a, 0x04380780, 0x10, 0x01121080, 0x480,
     };
     int i, ret;
 
@@ -265,11 +279,6 @@ int c985_audio_boot(struct c985_dev *dev)
     }
 
     c985_enc_write_config(dev, cfg);
-
-    ret = c985_mbox_send_polling(dev, 0x06, C985_AUD_TASK, C985_AUD_TASK,
-                                 false, true, 300);
-    if (ret && ret != -ETIMEDOUT)
-        return ret;
 
     ret = c985_mbox_send_polling(dev, 0x01, C985_AUD_TASK, C985_AUD_TASK,
                                  false, true, 300);
@@ -296,6 +305,22 @@ void c985_audio_teardown(struct c985_dev *dev)
 }
 
 /* ---- init / cleanup ---- */
+
+void c985_audio_get_stats(struct c985_dev *dev, struct c985_stream_stats *s)
+{
+    struct c985_audio *a = dev->audio_priv;
+
+    if (!a) {
+        memset(s, 0, sizeof(*s));
+        return;
+    }
+    atomic64_set(&s->frames_done, atomic64_read(&a->frames_done));
+    atomic64_set(&s->frames_dropped, atomic64_read(&a->frames_dropped));
+    atomic64_set(&s->bytes_done, atomic64_read(&a->bytes_done));
+    atomic64_set(&s->desc_non40, 0);
+    atomic64_set(&s->desc_bad, 0);
+    atomic64_set(&s->no_buf, 0);
+}
 
 int c985_audio_init(struct c985_dev *dev)
 {

@@ -38,6 +38,31 @@ C985_DEVICE=/dev/video2 ./run_tests.sh  # Override device path
 - Firmware loaded from kernel `request_firmware()` — expects `avermedia/qpvidfwpcie.bin` + `avermedia/qpaudfw.bin` in `/lib/firmware/`
 - Debugfs at `/sys/kernel/debug/c985/` exposes: `regs`, `mbox_log`, `frame_read`, `cpr_peek`, `dma_status`
 
+## Sudo / Privilege Rules (MANDATORY — DO NOT VIOLATE)
+- FIRST ACTION whenever a step may need privilege: run `sudo -l` (NEVER `sudo -n true`,
+  NEVER guess).
+- Passwordless (NOPASSWD) commands available (from `sudo -l`, re-read it every session,
+  it may drift):
+  - `tools/c985-bind.sh`
+  - `dmesg -T`
+  - `ls -la /sys/kernel/debug/c985/*`, `cat /sys/kernel/debug/c985/*`,
+    `tee /sys/kernel/debug/c985/*`, `ls /sys/kernel/debug/c985/`
+- `(ALL) ALL` requires an interactive password — CANNOT be run non-interactively.
+  **If a step needs `sudo` for something NOT in the NOPASSWD list, STOP and ask the
+  user for a sudoers line. Do NOT attempt a sudo command that will prompt for a
+  password — it hangs and wastes the user's time.**
+- Runtime debug output WITHOUT sudo:
+  - `/sys/kernel/debug/dynamic_debug/control` is directly writable by the user
+    (dynamic_debug dir is world-accessible; root-only bits are elsewhere). Use it to
+    enable kernel `dev_dbg`/`pr_debug` at runtime, e.g.:
+      echo 'file c985_audio.c +p' | sudo tee ...  # only if c985_audio is gated by sudo
+      echo 0x...  # (verify writability first: test `echo -n > /sys/kernel/debug/dynamic_debug/control`)
+  - Enable c985 module debug with: `echo "module c985 +p" > /sys/kernel/debug/dynamic_debug/control`
+  - A module built with `ccflags-y += -DDEBUG` always emits `dev_dbg` without needing
+    dynamic_debug; prefer the runtime `+p` knob to avoid a rebuild.
+
+## Common Gotchas
+
 ## Common Gotchas
 - `rmmod c985` fails with "Module in use" if any process holds `/dev/video*` — bind script kills holders
 - Stale module (rebuild without reload) detected via `srcversion` mismatch — bind script force-reloads

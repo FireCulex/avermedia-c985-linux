@@ -236,7 +236,16 @@ void c985_mbox_release_last(struct c985_dev *dev)
     dev->releasing = true;
 
     tag = r->resp_params[0] & 0xFFFF;
-    size_dw = (r->resp_params[3] * 3) / 2; /* total frame DWs: Y+U+V = 6*chroma/4 = 3*chroma/2 */
+    /* Audio (tag 0x82 raw LPCM) descriptor carries size already in DWORDs
+     * (resp_params[3]); video (0x81 raw YUV) carries chroma-plane BYTES, so
+     * total Y+U+V = 3*chroma/2 bytes, then /4 -> DWORDS = 3*chroma/8... but
+     * dbgview shows video release 0x6F4 = 0xbdd80 constant (777088 DW). For
+     * audio, 0x6F4 = resp_params[3] directly (dbgview: 0x480 for 4608B). */
+    if (tag == C985_DT_RAW_AUDIO) {
+        size_dw = r->resp_params[3];      /* already DWORDs */
+    } else {
+        size_dw = (r->resp_params[3] * 3) / 2; /* video: Y+U+V DWORDS */
+    }
     pts = r->resp_params[4] & 0x7FFFFFFFu;
     pts_valid = (r->resp_params[4] & 0x80000000u) ? 1 : 0;
     ring_idx = (r->resp_params[0] >> 24) & 0xFF;

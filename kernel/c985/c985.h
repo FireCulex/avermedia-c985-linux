@@ -38,7 +38,7 @@
 /* Descriptor control words (AVerPL33_x64.sys PedDmaQueueBuffers@0xB8C60):
  * mode 3 linear read vs default linear write */
 #define C985_DMA_CTRL_LIN_WRITE 0x0C02100F
-#define C985_DMA_CTRL_LIN_READ  0x0804200F
+#define C985_DMA_CTRL_LIN_READ  0x0C02100F
 /* Card-address flags: base-select always set; bit59 = end marker on the
  * LAST descriptor's card address for reads (no dummy descriptor on reads) */
 #define C985_DMA_CARD_FLAG      0x400000000ULL
@@ -394,6 +394,17 @@ int c985_v4l2_boot_encoder(struct c985_dev *dev);
 void c985_v4l2_stop_encoder(struct c985_dev *dev);
 void c985_v4l2_teardown(struct c985_dev *dev);
 void c985_enc_write_config(struct c985_dev *dev, const u32 *cfg);
+
+struct c985_stream_stats {
+    atomic64_t frames_done;
+    atomic64_t frames_dropped;
+    atomic64_t bytes_done;
+    atomic64_t desc_non40;
+    atomic64_t desc_bad;
+    atomic64_t no_buf;
+};
+void c985_v4l2_get_stats(struct c985_dev *dev, struct c985_stream_stats *s);
+void c985_audio_get_stats(struct c985_dev *dev, struct c985_stream_stats *s);
 
 /* ALSA audio capture device (Phase: audio) */
 int c985_audio_init(struct c985_dev *dev);
