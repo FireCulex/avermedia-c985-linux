@@ -172,6 +172,33 @@ struct c985_frame_desc {
     bool valid;
 };
 
+/*
+ * One pending full-frame DMA op: three serial plane reads (Y, U, V) sequenced
+ * by DMA completion, mirroring Windows CTask_BuildIoBlockYUVMB2RAS + the DPC
+ * completion model. Planes are read from a vb2_dma_sg scatterlist (one HW
+ * descriptor per SG element, PedDmaQueueBuffers style). done_cb fires once
+ * after all three planes complete (or a plane fails); the callback owns the
+ * vb2 buffer handoff + 0x30 ring-slot release.
+ */
+struct c985_frame_op;
+typedef void (*c985_frame_done_t)(struct c985_frame_op *op);
+
+struct c985_frame_op {
+    struct list_head list;
+    struct c985_dev *dev;
+    struct c985_frame_desc desc;
+
+    /* Scatter-gather backing (vb2_dma_sg plane 0). Plane byte offsets into
+     * the sg_table: Y@0, U@C985_Y_LEN, V@C985_Y_LEN+C985_C_LEN. */
+    struct sg_table *sgt;
+
+    /* completion state machine: 0=Y in flight, 1=U, 2=V, 3=done */
+    u8 phase;
+    struct work_struct work;       /* async completion work (scheduled by ISR) */
+    c985_frame_done_t done_cb;
+    bool failed;
+};
+
 /* Frame-mode DMA control words (asm-verified AVerPL33_x64.sys):
  * Y=0x08BE100F (mode1 fm1), U/V=0x4861000F (mode2 fm1) */
 #define C985_DMA_CTRL_FRAME_Y    0x08BE100F
@@ -214,6 +241,8 @@ struct c985_dev {
     struct c985_dma_chan dma_chans[64];
     int dma_write_chan;
     int dma_read_chan;
+    spinlock_t dma_cur_op_lock;   /* protects dma_cur_op (ISR/work/submit) */
+    struct c985_frame_op *dma_cur_op; /* frame op whose plane is in flight */
 
     /* Interrupt handling */
     int irq;
@@ -229,6 +258,7 @@ struct c985_dev {
     atomic_t irq_bar1_700_count;
     atomic_t irq_bar1_e04_count;
     atomic_t irq_dma_count;
+    struct workqueue_struct *dma_frame_wq; /* DMA frame-op continuation */
     struct workqueue_struct *mbox_drain_wq; /* mailbox FIFO drain */
     wait_queue_head_t doorbell_wq;
     wait_queue_head_t mbox_wq;
@@ -262,11 +292,11 @@ struct c985_dev {
 
     /* Interrupt-driven frame path (v4l2 streaming) */
     struct c985_frame_fifo frame_fifo;
-    struct work_struct mbox_drain_work;
+    struct delayed_work mbox_drain_work;
     bool streaming;
     /* Frame consumer hook: called from mbox drain work with each popped
      * 0x40 descriptor. Set by the v4l2 layer (Phase 3/4). */
-    void (*frame_consumer)(struct c985_dev *dev, struct c985_frame_desc *d);
+    int (*frame_consumer)(struct c985_dev *dev, struct c985_frame_desc *d);
     void *v4l2_priv;    /* opaque c985_v4l2 state (allocated on demand) */
 
     /* Audio consumer hook: called from mbox drain work with each popped
@@ -322,6 +352,13 @@ int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
                                 struct sg_table *sgt, u32 offset, u32 len,
                                 u32 width, bool chroma);
 
+/* Async SG frame-op (Y->U->V serial, ISR-driven continuation). */
+int c985_dma_read_frame_mode_sg_submit(struct c985_dev *dev, u32 card_addr,
+                                       struct sg_table *sgt, u32 offset,
+                                       u32 len, u32 width, bool chroma);
+int c985_dma_submit_frame(struct c985_frame_op *op);
+void c985_dma_frame_next(struct c985_frame_op *op);
+
 /* ARM control */
 int c985_qphci_init(struct c985_dev *dev);
 int c985_memory_init(struct c985_dev *dev);
@@ -336,10 +373,12 @@ int c985_mbox_send_polling(struct c985_dev *dev, u16 opcode, u32 param,
 int c985_mbox_drain(struct c985_dev *dev);
 int c985_mbox_wait_and_read(struct c985_dev *dev, unsigned long timeout_ms);
 void c985_mbox_release_last(struct c985_dev *dev);
+void c985_mbox_release_desc(struct c985_dev *dev, const struct c985_frame_desc *d);
 
 /* Mailbox frame FIFO (interrupt-driven streaming path) */
 bool c985_mbox_fifo_push(struct c985_dev *dev, struct c985_frame_desc *d);
 bool c985_mbox_fifo_pop(struct c985_dev *dev, struct c985_frame_desc *d);
+bool c985_mbox_fifo_push_front(struct c985_dev *dev, struct c985_frame_desc *d);
 
 void c985_mbox_isr_service(struct c985_dev *dev);
 void c985_mbox_drain_work_fn(struct work_struct *w);

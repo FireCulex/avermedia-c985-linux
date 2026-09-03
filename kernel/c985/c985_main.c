@@ -36,19 +36,25 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     mutex_init(&dev->dma_read_lock);
     mutex_init(&dev->frame_lock);
     spin_lock_init(&dev->irq_lock);
+    spin_lock_init(&dev->dma_cur_op_lock);
     init_waitqueue_head(&dev->doorbell_wq);
     init_waitqueue_head(&dev->mbox_wq);
     init_waitqueue_head(&dev->dma_wq);
     dev->doorbell_pending = false;
 
-    dev->mbox_drain_wq = alloc_ordered_workqueue("c985-mbox", 0);
-    if (!dev->mbox_drain_wq) {
+    dev->dma_frame_wq = alloc_ordered_workqueue("c985-dma", 0);
+    if (!dev->dma_frame_wq) {
         err = -ENOMEM;
         goto err_regions;
     }
+    dev->mbox_drain_wq = alloc_ordered_workqueue("c985-mbox", 0);
+    if (!dev->mbox_drain_wq) {
+        err = -ENOMEM;
+        goto err_dma_wq;
+    }
 
     spin_lock_init(&dev->frame_fifo.lock);
-    INIT_WORK(&dev->mbox_drain_work, c985_mbox_drain_work_fn);
+    INIT_DELAYED_WORK(&dev->mbox_drain_work, c985_mbox_drain_work_fn);
     atomic_set(&dev->frame_fifo.overflow, 0);
     atomic_set(&dev->frame_fifo.frames, 0);
     dev->streaming = false;
@@ -169,8 +175,11 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     /* v4l2/vb2 capture device */
     c985_v4l2_init(dev);
 
-    /* ALSA audio capture device */
-    c985_audio_init(dev);
+    /* ALSA audio capture device.
+     * BRANCH async-interrupt-dma: audio is intentionally DISABLED so this
+     * branch focuses solely on async (interrupt/DPC) VIDEO. Re-enable here
+     * once video is verified and audio is reworked to async DMA. */
+    // c985_audio_init(dev);
 
     pci_set_drvdata(pdev, dev);
 
@@ -178,6 +187,9 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
              dev->irq, dev->msi_enabled, dev->msix_enabled);
     return 0;
 
+err_dma_wq:
+    destroy_workqueue(dev->dma_frame_wq);
+    dev->dma_frame_wq = NULL;
 err_regions:
     devm_free_irq(&pdev->dev, dev->irq, dev);
     pci_release_regions(pdev);
@@ -198,9 +210,13 @@ void c985_remove(struct pci_dev *pdev)
     c985_debugfs_cleanup(dev);
 
     if (dev->mbox_drain_wq) {
-        cancel_work_sync(&dev->mbox_drain_work);
+        cancel_delayed_work_sync(&dev->mbox_drain_work);
         destroy_workqueue(dev->mbox_drain_wq);
         dev->mbox_drain_wq = NULL;
+    }
+    if (dev->dma_frame_wq) {
+        destroy_workqueue(dev->dma_frame_wq);
+        dev->dma_frame_wq = NULL;
     }
 
     if (dev->frame_buf) {

@@ -162,6 +162,11 @@ irqreturn_t c985_isr(int irq, void *dev_id)
         atomic_inc(&dev->irq_doorbell_count);
         dev->doorbell_pending = true;
         wake_up_all(&dev->doorbell_wq);
+        /* Interrupt-driven frame path: read the 0x40 descriptor, push the
+         * FIFO, and schedule the drain work (frame_consumer). Runs in hard
+         * IRQ context; mbox_isr_service is ISR-safe (no sleeping). */
+        if (dev->streaming)
+            c985_mbox_isr_service(dev);
     }
 
     /* Check mailbox HIU interrupt (BAR1+0x600 bit16 - HIU mailbox ready)
@@ -203,6 +208,20 @@ irqreturn_t c985_isr(int irq, void *dev_id)
             handled = 1;
             atomic_inc(&dev->irq_dma_count);
             complete(&dev->dma_chans[i].done);
+            /* Async frame-mode read: advance Y/U/V state machine on the
+             * read channel's in-flight frame op (process context). Take a
+             * consistent snapshot of dma_cur_op under the lock so the op
+             * pointer cannot be freed/reused between read and queue_work. */
+            if (i == dev->dma_read_chan && dev->dma_frame_wq) {
+                struct c985_frame_op *op;
+                unsigned long flags;
+
+                spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
+                op = dev->dma_cur_op;
+                spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
+                if (op)
+                    queue_work(dev->dma_frame_wq, &op->work);
+            }
         }
     }
 

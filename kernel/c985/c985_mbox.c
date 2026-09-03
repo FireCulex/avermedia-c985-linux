@@ -220,36 +220,39 @@ out:
     }
 }
 
-/* Send CompleteArm (0x30) for the descriptor currently in last_mbox.
+/* Send CompleteArm (0x30) for a frame descriptor (interrupt/FIFO path).
  * Encoding per CTask_CompleteArm (AVerPL33_x64.sys):
  *   0x6F8=tag  0x6F4=size DWORDS  0x6F0=PTS&0x7fffffff
  *   0x6EC=PTSValid(bit31 of w5)  0x6E4=ring index (w1>>24)
  *   0x6CC=(orig status & 0xFFFF0000)|1  0x6FC=(taskId<<16)|0x30 */
-void c985_mbox_release_last(struct c985_dev *dev)
+void c985_mbox_release_desc(struct c985_dev *dev, const struct c985_frame_desc *d)
 {
-    u32 saved[sizeof(dev->mbox_slots) / sizeof(u32)];
-    u32 tag, size_dw, pts, pts_valid, ring_idx, status;
-    struct c985_mbox_result *r = &dev->last_mbox;
+    u32 saved[ARRAY_SIZE(dev->mbox_slots)];
+    u32 tag, size_dw, pts, pts_valid, ring_idx;
 
-    if (dev->releasing)
+    /* Recursion guard: an in-progress release (or the mbox_post inside it
+     * triggering a nested release via auto_release) must not recurse. */
+    unsigned long flags;
+    spin_lock_irqsave(&dev->irq_lock, flags);
+    if (dev->releasing) {
+        spin_unlock_irqrestore(&dev->irq_lock, flags);
         return;
-    dev->releasing = true;
-
-    tag = r->resp_params[0] & 0xFFFF;
-    /* Audio (tag 0x82 raw LPCM) descriptor carries size already in DWORDs
-     * (resp_params[3]); video (0x81 raw YUV) carries chroma-plane BYTES, so
-     * total Y+U+V = 3*chroma/2 bytes, then /4 -> DWORDS = 3*chroma/8... but
-     * dbgview shows video release 0x6F4 = 0xbdd80 constant (777088 DW). For
-     * audio, 0x6F4 = resp_params[3] directly (dbgview: 0x480 for 4608B). */
-    if (tag == C985_DT_RAW_AUDIO) {
-        size_dw = r->resp_params[3];      /* already DWORDs */
-    } else {
-        size_dw = (r->resp_params[3] * 3) / 2; /* video: Y+U+V DWORDS */
     }
-    pts = r->resp_params[4] & 0x7FFFFFFFu;
-    pts_valid = (r->resp_params[4] & 0x80000000u) ? 1 : 0;
-    ring_idx = (r->resp_params[0] >> 24) & 0xFF;
-    status = (r->from_arm_status & 0xFFFF0000u) | 1u;
+    dev->releasing = true;
+    spin_unlock_irqrestore(&dev->irq_lock, flags);
+
+    tag = d->tag & 0xFFFF;
+    /* Audio (tag 0x82 raw) descriptor carries size already in DWORDs
+     * (chroma field); video (0x81 raw YUV) carries chroma-plane BYTES. Total
+     * Y+U+V = 6*chroma bytes (Y=4*chroma, U=V=chroma), so DWORDs = 6*chroma/4
+     * = 3*chroma/2 = 0xbdd80 for 1080p (dbgview 0x6F4). */
+    if (tag == C985_DT_RAW_AUDIO)
+        size_dw = d->chroma;                 /* already DWORDs */
+    else
+        size_dw = (d->chroma * 3) / 2;       /* video: Y+U+V DWORDS */
+    pts = d->pts_raw & 0x7FFFFFFFu;
+    pts_valid = (d->pts_raw & 0x80000000u) ? 1 : 0;
+    ring_idx = d->ring_idx & 0xFF;
 
     memcpy(saved, dev->mbox_slots, sizeof(saved));
     memset(dev->mbox_slots, 0, sizeof(saved));
@@ -258,10 +261,33 @@ void c985_mbox_release_last(struct c985_dev *dev)
     dev->mbox_slots[2] = pts_valid;  /* 0x6EC */
     dev->mbox_slots[4] = ring_idx;   /* 0x6E4 (slot3 0x6E8 left 0) */
 
-    c985_mbox_send_polling(dev, 0x30, tag, r->task_id, false, false, 200);
+    c985_mbox_send_polling(dev, 0x30, tag, d->task, false, false, 200);
 
     memcpy(dev->mbox_slots, saved, sizeof(saved));
+
+    spin_lock_irqsave(&dev->irq_lock, flags);
     dev->releasing = false;
+    spin_unlock_irqrestore(&dev->irq_lock, flags);
+}
+
+/* CompleteArm (0x30) for the descriptor currently in last_mbox (polling path).
+ * Re-encodes last_mbox into a c985_frame_desc and delegates to
+ * c985_mbox_release_desc. */
+void c985_mbox_release_last(struct c985_dev *dev)
+{
+    struct c985_mbox_result *r = &dev->last_mbox;
+    struct c985_frame_desc d;
+
+    d.tag = r->resp_params[0] & 0xFFFF;
+    d.ring_idx = (r->resp_params[0] >> 24) & 0xFF;
+    d.y_dw = r->resp_params[1];
+    d.u_dw = r->resp_params[2];
+    d.chroma = r->resp_params[3];
+    d.pts_raw = r->resp_params[4];
+    d.task = r->task_id;
+    d.valid = true;
+
+    c985_mbox_release_desc(dev, &d);
 }
 
 /* Poll for an unsolicited 0x40, capture it into last_mbox and consume it.
@@ -404,34 +430,64 @@ bool c985_mbox_fifo_pop(struct c985_dev *dev, struct c985_frame_desc *d)
     return ok;
 }
 
-/* ISR-side service: read the mailbox burst and, for opcode 0x40, extract a
- * frame descriptor. Must NOT sleep. Returns true if a 0x40 was queued. */
+/* Push a descriptor back onto the FRONT of the FIFO (deferral: a frame we
+ * popped but could not submit because the engine was busy). */
+bool c985_mbox_fifo_push_front(struct c985_dev *dev, struct c985_frame_desc *d)
+{
+    struct c985_frame_fifo *f = &dev->frame_fifo;
+    unsigned long flags;
+    bool ok = false;
+
+    spin_lock_irqsave(&f->lock, flags);
+    if (f->count < C985_FRAME_FIFO_DEPTH) {
+        f->tail = (f->tail - 1 + C985_FRAME_FIFO_DEPTH) % C985_FRAME_FIFO_DEPTH;
+        f->ring[f->tail] = *d;
+        f->count++;
+        ok = true;
+    } else {
+        atomic_inc(&f->overflow);
+    }
+    spin_unlock_irqrestore(&f->lock, flags);
+    return ok;
+}
+
+/* ISR-side service: only WAKE the drain work. The actual mailbox read and
+ * 0x6C8-bit0 clear is done by the drain work in process context (polling
+ * 0x6C8 bit0), because the firmware's frame-notification doorbell has proven
+ * lossy (a descriptor can sit at 0x6C8 bit0=1 with no corresponding doorbell
+ * edge). Polling in the workqueue is the reliable path. */
 void c985_mbox_isr_service(struct c985_dev *dev)
 {
-    u32 msg, status;
-    struct c985_frame_desc d;
-    u32 p[5];
+    queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
+}
+
+/* Poll 0x6C8 bit0 (process context, may sleep). If a descriptor is pending,
+ * copy it out and clear bit0 + optionally ack. Returns true if a 0x40/0x41
+ * frame descriptor was read into *d. */
+static bool c985_mbox_poll_desc(struct c985_dev *dev, struct c985_frame_desc *d)
+{
+    u32 msg, status, p[5];
     int i;
 
-    /* DTM sets 0x6C8 bit0 and the params BEFORE the doorbell; the ISR runs
-     * slightly after, so a tiny settle is normally unnecessary, but the burst
-     * may still be mid-flight on the same bus clock - read param regs after
-     * the status. We read status first, then params, then clear bit0. */
     status = c985_read_bar1(dev, C985_FROM_ARM_MSG_STATUS);
+    if (!(status & 1))
+        return false;
+
+    /* DTM sets 0x6C8 bit0 then writes params/0x6B0; settle before reading. */
+    usleep_range(100, 200);
+
     msg = c985_read_bar1(dev, C985_FROM_ARM_MESSAGE);
     for (i = 0; i < 5; i++)
         p[i] = c985_read_bar1(dev, 0x6B4 + i * 4);
 
-    /* Always clear 0x6C8 bit0 so DTM doesn't wedge (it spins on bit0). */
-    if (status & 1)
-        c985_write_bar1(dev, C985_FROM_ARM_MSG_STATUS, status & ~1u);
+    /* Clear 0x6C8 bit0 so DTM doesn't wedge (it spins on bit0). */
+    c985_write_bar1(dev, C985_FROM_ARM_MSG_STATUS, status & ~1u);
 
-    /* Ack message if bit8 was set (mirrors polling path ack logic). */
+    /* Ack if bit8 was set. */
     if (status & 0x100) {
         u32 ack_op = (msg & 0xFFFF) < 0x80 ? 0x31 : 0xA2;
         u32 ack_word = (msg & 0xFFFF0000) | ack_op;
         u8 task = (msg >> 16) & 0xFF;
-        /* Best-effort ack; mailbox may be busy - skip if so. */
         if (!(c985_read_bar1(dev, C985_TO_ARM_MSG_STATUS) & 1)) {
             c985_write_bar1(dev, C985_TO_ARM_PARAM0, 0);
             c985_write_bar1(dev, C985_TO_ARM_MSG_STATUS,
@@ -442,46 +498,70 @@ void c985_mbox_isr_service(struct c985_dev *dev)
         }
     }
 
-    /* Only 0x40/0x41 (EncDataOutReq frame-done) feeds the frame FIFO. */
+    /* Only 0x40/0x41 feeds the frame FIFO. */
     if ((msg & 0xFF) != 0x40 && (msg & 0xFF) != 0x41)
-        return;
+        return false;
 
-    d.tag = p[0] & 0xFFFF;
-    d.ring_idx = (p[0] >> 24) & 0xFF;
-    d.y_dw = p[1];
-    d.u_dw = p[2];
-    d.chroma = p[3];
-    d.pts_raw = p[4];
-    d.task = (msg >> 16) & 0xFF;
-    d.valid = true;
-
-    if (c985_mbox_fifo_push(dev, &d))
-        queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work);
+    d->tag = p[0] & 0xFFFF;
+    d->ring_idx = (p[0] >> 24) & 0xFF;
+    d->y_dw = p[1];
+    d->u_dw = p[2];
+    d->chroma = p[3];
+    d->pts_raw = p[4];
+    d->task = (msg >> 16) & 0xFF;
+    d->valid = true;
+    return true;
 }
 
-/* Workqueue consumer: drain FIFO, hand each descriptor to the appropriate
- * layer. taskId 0 = video (frame_consumer), taskId 1 = audio
- * (audio_consumer). */
+/* Workqueue consumer: poll 0x6C8, drain any pending descriptor, and hand
+ * exactly ONE descriptor per invocation to the appropriate layer (taskId 0 =
+ * video frame_consumer, taskId 1 = audio_consumer). The doorbell ISR only
+ * wakes this work (fast path); the authoritative mailbox read is a POLL here,
+ * because the firmware's frame doorbell is lossy. If the FIFO is empty and no
+ * descriptor is pending, reschedule after a short delay so a doorbell that got
+ * lost never wedges the stream. */
 void c985_mbox_drain_work_fn(struct work_struct *w)
 {
-    struct c985_dev *dev = container_of(w, struct c985_dev, mbox_drain_work);
+    struct c985_dev *dev = container_of(w, struct c985_dev,
+                                        mbox_drain_work.work);
     struct c985_frame_desc d;
 
-    while (c985_mbox_fifo_pop(dev, &d)) {
-        if (!d.valid)
-            continue;
-        if (d.task == C985_AUD_TASK) {
-            if (dev->audio_consumer)
-                dev->audio_consumer(dev, &d);
-            else
-                dev_warn_ratelimited(&dev->pdev->dev,
-                    "0x40 audio frame dropped: no audio_consumer registered\n");
-            continue;
+    if (!READ_ONCE(dev->streaming))
+        return;
+
+    /* Poll the mailbox into the FIFO (clears 0x6C8, unblocks DTM). */
+    while (c985_mbox_poll_desc(dev, &d))
+        if (!c985_mbox_fifo_push(dev, &d))
+            break;
+
+    /* Process one descriptor. */
+    if (!c985_mbox_fifo_pop(dev, &d)) {
+        /* Nothing pending: re-poll shortly to recover from any lost doorbell. */
+        queue_delayed_work(dev->mbox_drain_wq, &dev->mbox_drain_work,
+                           msecs_to_jiffies(2));
+        return;
+    }
+
+    if (!d.valid) {
+        queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
+        return;
+    }
+
+    if (d.task == C985_AUD_TASK) {
+        if (dev->audio_consumer)
+            dev->audio_consumer(dev, &d);
+        c985_mbox_release_desc(dev, &d);
+        queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
+        return;
+    }
+
+    if (dev->frame_consumer) {
+        int fr = dev->frame_consumer(dev, &d);
+        if (fr == -EBUSY) {
+            /* Engine busy: defer. done_cb re-pumps when the engine frees. */
+            c985_mbox_fifo_push_front(dev, &d);
+            return;
         }
-        if (dev->frame_consumer)
-            dev->frame_consumer(dev, &d);
-        else
-            dev_warn_ratelimited(&dev->pdev->dev,
-                "0x40 frame dropped: no frame_consumer registered\n");
+        queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
     }
 }

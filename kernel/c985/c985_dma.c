@@ -314,19 +314,16 @@ out:
     return ret;
 }
 
-/* Scatter-gather frame-mode read. Identical geometry/control to the
- * contiguous c985_dma_read_frame_mode, but instead of a single host DMA
- * address it walks a vb2_dma_sg sg_table starting at `offset` bytes and emits
- * ONE chained descriptor per SG element — exactly the Windows PedDmaQueueBuffers
- * model (each SGL fragment becomes its own descriptor, linked via next_desc).
- *
- * card_addr is the plane base (DWORD<<2, per c985_dma_read_frame_mode); it is
- * advanced by each element's transferred byte count. Only the LAST descriptor
+/* Internal: build the SG descriptor chain for one frame-mode plane read and
+ * kick the engine. Does NOT wait for completion and does NOT take the mutex —
+ * the caller holds dev->dma_read_lock. Returns 0 on submit, -EBUSY if engine
+ * busy, -EINVAL on short sg_table. Each SG element becomes one chained HW
+ * descriptor (Windows PedDmaQueueBuffers model); only the LAST descriptor
  * carries the bit59 end-of-chain marker and next_desc=0.
  */
-int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
-                                struct sg_table *sgt, u32 offset, u32 len,
-                                u32 width, bool chroma)
+static int c985_dma_read_frame_mode_sg_kick(struct c985_dev *dev, u32 card_addr,
+                                            struct sg_table *sgt, u32 offset,
+                                            u32 len, u32 width, bool chroma)
 {
     struct c985_dma_chan *chan = &dev->dma_chans[dev->dma_read_chan];
     struct c985_dma_desc *desc;
@@ -334,13 +331,8 @@ int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
     dma_addr_t dpa;
     u32 ctrl = chroma ? 0x4861000F : 0x08BE100F;
     u64 offex;
-    u32 card_cur = card_addr, remaining = len, in_elem;
+    u32 card_cur = card_addr, remaining = len, in_elem, offset_orig = offset;
     int ndesc = 0, ret;
-
-    if (!sgt || !sgt->sgl)
-        return -EINVAL;
-
-    mutex_lock(&dev->dma_read_lock);
 
     if (!chan->in_use) {
         ret = -EINVAL;
@@ -364,13 +356,15 @@ int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
             ((u64)(chroma ? 8 : 16) << 40) |
             ((u64)3 << 56);
 
-    /* Advance to the SG element that contains the plane's starting offset. */
+    /* Advance to the SG element containing the plane's starting offset. */
     sg = sgt->sgl;
     while (sg_dma_len(sg) > 0 && offset >= (u32)sg_dma_len(sg)) {
         offset -= (u32)sg_dma_len(sg);
         sg = sg_next(sg);
-        if (!sg)
-            goto bad_len;
+        if (!sg) {
+            ret = -EINVAL;
+            goto out;
+        }
     }
     in_elem = offset;
 
@@ -382,8 +376,10 @@ int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
         u32 n = min(seglen, remaining);
         bool last;
 
-        if (ndesc >= C985_DMA_NUM_DESCS)
-            goto bad_len;
+        if (ndesc >= C985_DMA_NUM_DESCS) {
+            ret = -EINVAL;
+            goto out;
+        }
 
         last = (n == remaining);
 
@@ -402,24 +398,162 @@ int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
         sg = sg_next(sg);
     }
 
-    if (remaining)
-        goto bad_len;
+    if (remaining) {
+        ret = -EINVAL;
+        goto out;
+    }
 
     wmb();
     iowrite32(lower_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_LO);
     iowrite32(upper_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_HI);
     iowrite32(C985_DMA_CTRL_START, chan->regs + C985_DMA_REG_CTRL);
+    return 0;
 
-    ret = c985_dma_wait(dev, dev->dma_read_chan, 3000);
 out:
-    mutex_unlock(&dev->dma_read_lock);
+    dev_dbg(&dev->pdev->dev,
+            "DMA SG submit fail: card=0x%x off=%u len=%u ndesc=%d ret=%d\n",
+            card_addr, offset_orig, len, ndesc, ret);
     return ret;
+}
 
-bad_len:
-    dev_err(&dev->pdev->dev,
-            "DMA SG: sg_table too short for offset=%u len=%u (ndesc=%d)\n",
-            offset + (u32)(len - remaining), len, ndesc);
-    ret = -EINVAL;
+/* Synchronous frame-mode SG read (one plane). Blocks for DMA completion, used
+ * by the linear legacy paths that still read planes inline. */
+int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
+                                struct sg_table *sgt, u32 offset, u32 len,
+                                u32 width, bool chroma)
+{
+    int ret;
+
+    if (!sgt || !sgt->sgl)
+        return -EINVAL;
+
+    mutex_lock(&dev->dma_read_lock);
+    ret = c985_dma_read_frame_mode_sg_kick(dev, card_addr, sgt, offset,
+                                           len, width, chroma);
+    if (ret == 0)
+        ret = c985_dma_wait(dev, dev->dma_read_chan, 3000);
     mutex_unlock(&dev->dma_read_lock);
     return ret;
+}
+
+/* Asynchronous frame-mode SG read: submit ONE plane, return immediately.
+ * Completion is signalled via the completion counter; the frame-op state
+ * machine advances on the ISR-scheduled continuation work. Caller must hold
+ * dev->dma_read_lock (the frame-op path takes it around the full Y/U/V seq). */
+int c985_dma_read_frame_mode_sg_submit(struct c985_dev *dev, u32 card_addr,
+                                       struct sg_table *sgt, u32 offset,
+                                       u32 len, u32 width, bool chroma)
+{
+    return c985_dma_read_frame_mode_sg_kick(dev, card_addr, sgt, offset,
+                                            len, width, chroma);
+}
+
+/* ---- Async full-frame DMA (Y -> U -> V serial, Windows DPC model) ----
+ *
+ * c985_dma_submit_frame() starts the Y plane. The ISR, on DMA completion for
+ * the read channel, schedules c985_dma_frame_work, which calls
+ * c985_dma_frame_next() to advance U -> V -> completion. done_cb owns buffer
+ * handoff + 0x30 release. Plane card addresses (DWORD -> byte, dw<<2):
+ *   Y = desc.y_dw << 2; U = desc.u_dw << 2; V = U + C985_V_OFFSET_BYTES.
+ */
+
+static void c985_dma_frame_work(struct work_struct *w)
+{
+    struct c985_frame_op *op = container_of(w, struct c985_frame_op, work);
+    c985_dma_frame_next(op);
+}
+
+/* Advance a frame op to its next plane, or complete it. Runs in process
+ * context (workqueue) because plane submission may lazily alloc the desc ring
+ * via dma_alloc_coherent (not hard-IRQ safe). */
+void c985_dma_frame_next(struct c985_frame_op *op)
+{
+    struct c985_dev *dev = op->dev;
+    u32 card = 0, offset = 0, len = 0;
+    bool chroma;
+    int ret;
+    unsigned long flags;
+
+    if (op->failed)
+        goto complete;
+
+    switch (op->phase) {
+    case 0: /* Y done -> U */
+        card = op->desc.u_dw << 2;
+        offset = C985_Y_LEN;
+        len = C985_C_LEN;
+        chroma = true;
+        op->phase = 1;
+        break;
+    case 1: /* U done -> V */
+        card = (op->desc.u_dw << 2) + C985_V_OFFSET_BYTES;
+        offset = C985_Y_LEN + C985_C_LEN;
+        len = C985_C_LEN;
+        chroma = true;
+        op->phase = 2;
+        break;
+    default:
+        goto complete;
+    }
+
+    mutex_lock(&dev->dma_read_lock);
+    ret = c985_dma_read_frame_mode_sg_submit(dev, card, op->sgt, offset,
+                                             len, C985_WIDTH / 2, chroma);
+    mutex_unlock(&dev->dma_read_lock);
+    if (ret) {
+        dev_err(&dev->pdev->dev,
+                "frame op: plane %d submit failed: %d\n", op->phase, ret);
+        op->failed = true;
+        goto complete;
+    }
+    /* op remains dev->dma_cur_op for the ISR to schedule the next plane. */
+    return;
+
+complete:
+    spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
+    dev->dma_cur_op = NULL;
+    spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
+    op->phase = 3;
+    if (op->done_cb)
+        op->done_cb(op);
+}
+
+/* Submit a full frame: start Y; U/V driven by DMA completion ISR. Returns
+ * -EBUSY if another frame op is still in flight (single read engine + single
+ * dma_cur_op: the caller must retry/drop). */
+int c985_dma_submit_frame(struct c985_frame_op *op)
+{
+    struct c985_dev *dev = op->dev;
+    unsigned long flags;
+    int ret;
+
+    op->phase = 0;
+    op->failed = false;
+    INIT_WORK(&op->work, c985_dma_frame_work);
+
+    /* Claim the single in-flight slot before kicking Y, so a concurrent
+     * frame_consumer cannot overwrite dma_cur_op mid-sequence. */
+    spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
+    if (dev->dma_cur_op) {
+        spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
+        return -EBUSY;
+    }
+    dev->dma_cur_op = op;
+    spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
+
+    mutex_lock(&dev->dma_read_lock);
+    ret = c985_dma_read_frame_mode_sg_submit(dev, op->desc.y_dw << 2,
+                                             op->sgt, 0, C985_Y_LEN,
+                                             C985_WIDTH, false);
+    mutex_unlock(&dev->dma_read_lock);
+    if (ret) {
+        /* Failed to kick Y: release the in-flight slot so the next frame
+         * can be attempted. */
+        spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
+        dev->dma_cur_op = NULL;
+        spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
+        return ret;
+    }
+
+    return 0;
 }
