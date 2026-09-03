@@ -68,6 +68,8 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     atomic_set(&dev->irq_bar1_700_count, 0);
     atomic_set(&dev->irq_bar1_e04_count, 0);
     atomic_set(&dev->irq_dma_count, 0);
+    atomic_set(&dev->dma_stalls, 0);
+    atomic_set(&dev->dma_ebusy_submits, 0);
 
     err = pcim_enable_device(pdev);
     if (err) {

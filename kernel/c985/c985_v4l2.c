@@ -51,14 +51,12 @@ struct c985_v4l2 {
     atomic64_t desc_bad;       /* 0x40 but zero addrs */
     atomic64_t no_buf;         /* 0x40 valid but no queued vb2 buffer */
 
-    /* PTS rebase anchor: maps the firmware's per-frame PTS (microseconds,
-     * bit31=valid) onto CLOCK_MONOTONIC (ns) so v4l2 buffers carry a steady,
-     * evenly-paced timestamp even though serial DMA completion is jittery.
-     * A host-clock timestamp (ktime_get_ns) otherwise collapses a late frame
-     * onto the same presentation slot as its predecessor -> duplicate frames. */
-    bool pts_rebase_valid;
-    u32 pts_anchor_us;
-    u64 host_anchor_ns;
+    /* Monotonic timestamp clamp: last emitted buffer timestamp (ns). The
+     * firmware PTS stalls/repeats and is not a reliable presentation clock,
+     * so we stamp the host clock but clamp forward by one nominal frame
+     * period so serial-DMA jitter / a stalled frame cannot collapse two
+     * distinct buffers onto the same presentation slot (non-monotonic PTS). */
+    u64 host_prev_ns;
 };
 
 /* Per-vb2-buffer driver state, embedded ahead of vb2_v4l2_buffer. */
@@ -95,38 +93,18 @@ static void c985_v4l2_frame_done(struct c985_frame_op *op)
     struct c985_v4l2 *c = buf->vb.vb2_buf.vb2_queue->drv_priv;
     struct c985_dev *dev = op->dev;
 
-    /* Timestamp: prefer the firmware's per-frame PTS (microseconds, bit31
-     * valid), rebased onto CLOCK_MONOTONIC so the sequence pacing reflects
-     * actual capture cadence, not DMA-completion jitter. The firmware PTS is
-     * on its own free-running clock, so we anchor it to the host clock on the
-     * first valid-PTS frame and interpolate thereafter. A wrap (large negative
-     * jump) re-anchors instead of emitting a bogus timestamp. */
+    /* Timestamp: strictly monotonic host clock. The firmware per-frame PTS is
+     * NOT a reliable presentation clock (it stalls/repeats: witnessed as
+     * ffmpeg "non-strictly-monotonic PTS" + a frozen -t clock). Stamp
+     * CLOCK_MONOTONIC but clamp forward by one nominal frame period vs the
+     * previously emitted timestamp so completion jitter or a stalled frame
+     * cannot emit a backwards/duplicate presentation time. */
     {
-        u32 pts_us = op->desc.pts_raw & 0x7FFFFFFFu;
-        bool pts_valid = (op->desc.pts_raw & 0x80000000u) != 0;
-        u64 ts;
+        u64 now = ktime_get_ns();
+        u64 min = c->host_prev_ns ? c->host_prev_ns + NSEC_PER_SEC / 30 : 0;
+        u64 ts = now > min ? now : min;
 
-        if (pts_valid) {
-            if (!c->pts_rebase_valid) {
-                c->pts_anchor_us = pts_us;
-                c->host_anchor_ns = ktime_get_ns();
-                c->pts_rebase_valid = true;
-                ts = c->host_anchor_ns;
-            } else {
-                s64 d_us = (s64)(pts_us - c->pts_anchor_us);
-                /* PTS is 32-bit and wraps; a negative jump beyond a half
-                 * period is a wrap, not a reorder. Re-anchor on wrap. */
-                if (d_us < 0 && (u32)(-d_us) > (1u << 30)) {
-                    c->pts_anchor_us = pts_us;
-                    c->host_anchor_ns = ktime_get_ns();
-                    ts = c->host_anchor_ns;
-                } else {
-                    ts = c->host_anchor_ns + (s64)(pts_us - c->pts_anchor_us) * 1000ull;
-                }
-            }
-        } else {
-            ts = ktime_get_ns();
-        }
+        c->host_prev_ns = ts;
         buf->vb.vb2_buf.timestamp = ts;
     }
     buf->vb.sequence = (u32)atomic64_inc_return(&c->frames_done);
@@ -315,9 +293,8 @@ static int c985_start_streaming(struct vb2_queue *q, unsigned int count)
     /* Reset the mailbox wait state (doorbell may be stale from boot). */
     dev->doorbell_pending = false;
 
-    /* Fresh stream: re-anchor the PTS->host-clock rebase on the next valid
-     * PTS (firmware PTS is per-boot; a stale anchor would skew timestamps). */
-    c->pts_rebase_valid = false;
+    /* Fresh stream: reset the monotonic timestamp clamp base. */
+    c->host_prev_ns = 0;
 
     /* Register the interrupt-driven consumers: ISR -> mbox FIFO -> drain
      * work -> frame_consumer / audio_consumer. No polling kthread. */
@@ -656,6 +633,7 @@ int c985_v4l2_init(struct c985_dev *dev)
     atomic64_set(&c->desc_non40, 0);
     atomic64_set(&c->desc_bad, 0);
     atomic64_set(&c->no_buf, 0);
+    c->host_prev_ns = 0;
 
     snprintf(c->v4l2_dev.name, sizeof(c->v4l2_dev.name), "%s-%s",
              "c985", pci_name(dev->pdev));

@@ -555,6 +555,9 @@ void c985_dma_frame_next(struct c985_frame_op *op)
                                              len, C985_WIDTH / 2, chroma);
     mutex_unlock(&dev->dma_read_lock);
     if (ret) {
+        if (ret == -EBUSY)
+            atomic_inc(&dev->dma_stalls);
+        atomic_inc(&dev->dma_ebusy_submits);
         dev_err(&dev->pdev->dev,
                 "frame op: plane %d submit failed: %d\n", op->phase, ret);
         op->failed = true;
@@ -589,6 +592,10 @@ int c985_dma_submit_frame(struct c985_frame_op *op)
      * frame_consumer cannot overwrite dma_cur_op mid-sequence. */
     spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
     if (dev->dma_cur_op) {
+        /* Pipeline stall: a previous in-flight op still owns the single
+         * engine slot and never completed. Count it, then defer. */
+        atomic_inc(&dev->dma_stalls);
+        atomic_inc(&dev->dma_ebusy_submits);
         spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
         return -EBUSY;
     }
@@ -631,6 +638,8 @@ int c985_dma_submit_linear(struct c985_frame_op *op)
     /* Claim the single in-flight slot before kicking the transfer. */
     spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
     if (dev->dma_cur_op) {
+        atomic_inc(&dev->dma_stalls);
+        atomic_inc(&dev->dma_ebusy_submits);
         spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
         return -EBUSY;
     }

@@ -252,6 +252,13 @@ struct c985_dev {
     spinlock_t dma_cur_op_lock;   /* protects dma_cur_op (ISR/work/submit) */
     struct c985_frame_op *dma_cur_op; /* frame op whose plane is in flight */
 
+    /* DMA-stall telemetry: a frame whose plane submit returned -EBUSY while
+     * the engine was already latched to another op (dma_cur_op set + engine
+     * BUSY) means the in-flight op never completed -> pipeline stalled behind
+     * a wedged transfer. One increment per detected stall event. */
+    atomic_t dma_stalls;
+    atomic_t dma_ebusy_submits;
+
     /* Interrupt handling */
     int irq;
     bool msi_enabled;
