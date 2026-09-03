@@ -188,8 +188,8 @@ struct c985_frame_op {
     struct c985_dev *dev;
     struct c985_frame_desc desc;
 
-    /* Scatter-gather backing (vb2_dma_sg plane 0). Plane byte offsets into
-     * the sg_table: Y@0, U@C985_Y_LEN, V@C985_Y_LEN+C985_C_LEN. */
+    /* Video: scatter-gather backing (vb2_dma_sg plane 0). Plane byte offsets
+     * into the sg_table: Y@0, U@C985_Y_LEN, V@C985_Y_LEN+C985_C_LEN. */
     struct sg_table *sgt;
 
     /* completion state machine: 0=Y in flight, 1=U, 2=V, 3=done */
@@ -197,6 +197,14 @@ struct c985_frame_op {
     struct work_struct work;       /* async completion work (scheduled by ISR) */
     c985_frame_done_t done_cb;
     bool failed;
+
+    /* Linear (audio) path: a single card->host transfer, no frame geometry.
+     * card_addr / len are bytes; dst_phys is the DMA address of the host
+     * bounce buffer (dma_alloc_coherent, already mapped — no map/unmap). */
+    bool linear;
+    u32 card_addr;
+    u32 len;
+    dma_addr_t dst_phys;
 };
 
 /* Frame-mode DMA control words (asm-verified AVerPL33_x64.sys):
@@ -302,10 +310,12 @@ struct c985_dev {
 
     /* Audio consumer hook: called from mbox drain work with each popped
      * 0x40/0x41 descriptor whose taskId==C985_AUD_TASK. The audio layer
-     * DMA-reads the (compressed AAC) buffer linearly and feeds ALSA.
-     * Descriptor fields reused: y_dw = buffer addr (dwords), chroma = size
-     * (bytes). Set by the audio (c985_audio) layer. */
-    void (*audio_consumer)(struct c985_dev *dev, struct c985_frame_desc *d);
+     * asynchronously DMA-reads the (compressed AAC) buffer linearly and feeds
+     * ALSA. Return 0 = submitted (in flight), -EBUSY = engine busy (deferral:
+     * caller must push the descriptor back to the FIFO front), <0 = dropped
+     * (ring slot already released by the layer). Descriptor fields reused:
+     * y_dw = buffer addr (dwords), chroma = size (bytes). */
+    int (*audio_consumer)(struct c985_dev *dev, struct c985_frame_desc *d);
     void *audio_priv;   /* opaque c985_audio state (allocated on demand) */
 
     /* CPR peek (debugfs) */
@@ -358,6 +368,7 @@ int c985_dma_read_frame_mode_sg_submit(struct c985_dev *dev, u32 card_addr,
                                        struct sg_table *sgt, u32 offset,
                                        u32 len, u32 width, bool chroma);
 int c985_dma_submit_frame(struct c985_frame_op *op);
+int c985_dma_submit_linear(struct c985_frame_op *op);
 void c985_dma_frame_next(struct c985_frame_op *op);
 
 /* ARM control */

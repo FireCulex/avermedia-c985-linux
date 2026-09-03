@@ -48,6 +48,8 @@ struct c985_audio {
     dma_addr_t dma_phys;
     size_t dma_size;
 
+    struct c985_frame_op op; /* single in-flight async linear audio DMA op */
+
     atomic64_t frames_done;
     atomic64_t bytes_done;
     atomic64_t frames_dropped;   /* fifo full or no data */
@@ -56,44 +58,23 @@ struct c985_audio {
     unsigned long last_period;   /* last signaled period index */
 };
 
-/* ---- audio_consumer: called from mbox drain work for taskId==1 descs ---- */
+/* ---- audio_consumer + async completion (taskId==1 descs) ---- */
 
-static void c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
+/* DMA completion: run in dma_frame_wq (process context) after the linear
+ * read lands. Copy the bounce buffer into the ALSA ring/fifo, release the
+ * firmware ring slot (0x30), and re-pump the mbox drain work. */
+static void c985_audio_done(struct c985_frame_op *op)
 {
+    struct c985_dev *dev = op->dev;
     struct c985_audio *a = dev->audio_priv;
     struct snd_pcm_substream *substream;
     struct snd_pcm_runtime *runtime;
     unsigned long buf_bytes, period_bytes;
     u8 *dma_area;
     unsigned long off;
-    int n;
+    u32 bytes = op->desc.chroma << 2;
 
-    if (!a || !a->running) {
-        dev_dbg(&dev->pdev->dev, "audio: desc dropped, not running\n");
-        return;
-    }
-
-    /* Class-4 (compressed audio) descriptor: addr = y_dw (DWORDS -> <<2 for
-     * bytes), size = chroma field in DWORDS (firmware reserved3), so -> <<2
-     * for byte length. Verified against the Windows class-4 record build
-     * (addrDWORDS=0x6B8, sizeDWORDS=0x6C0). */
-    u32 bytes = d->chroma << 2;
-
-    if (d->y_dw == 0 || d->chroma == 0 || bytes > a->dma_size) {
-        dev_dbg(&dev->pdev->dev, "audio: bad desc addr=0x%x size_dw=%u\n",
-                d->y_dw, d->chroma);
-        atomic64_inc(&a->frames_dropped);
-        return;
-    }
-
-    /* Linear read (no frame geometry): card buffer addr << 2, size = bytes. */
-    n = c985_dma_read_linear(dev, d->y_dw << 2, a->dma_phys, bytes);
-    if (n < 0) {
-        dev_dbg(&dev->pdev->dev, "audio: DMA read failed: %d\n", n);
-        atomic64_inc(&a->frames_dropped);
-        return;
-    }
-
+    /* Copy bounce -> ALSA ring (or kfifo if no substream yet). */
     substream = READ_ONCE(a->substream);
     if (!substream || !substream->runtime)
         goto fifo;
@@ -122,19 +103,82 @@ static void c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
         snd_pcm_period_elapsed(substream);
     }
 
-    atomic64_inc(&a->frames_done);
-    atomic64_add(bytes, &a->bytes_done);
-    wake_up_all(&a->wq);
-    return;
+    goto accounted;
 
 fifo:
     mutex_lock(&a->lock);
     if (kfifo_in(&a->fifo, a->dma_buf, bytes) < bytes)
         atomic64_inc(&a->frames_dropped);
     mutex_unlock(&a->lock);
-    atomic64_inc(&a->frames_done);
-    atomic64_add(bytes, &a->bytes_done);
+
+accounted:
+    if (!op->failed) {
+        atomic64_inc(&a->frames_done);
+        atomic64_add(bytes, &a->bytes_done);
+    } else {
+        atomic64_inc(&a->frames_dropped);
+    }
     wake_up_all(&a->wq);
+
+    /* Release the card ring slot now that the DMA has actually completed. */
+    c985_mbox_release_desc(dev, &op->desc);
+
+    /* Engine is free: re-pump the drain work so queued descriptors flow. */
+    queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
+}
+
+/* audio_consumer: called from mbox drain work for taskId==1 descriptors.
+ * Submits the linear DMA read ASYNCHRONOUSLY (Windows sync(0)/DPC model) and
+ * returns immediately. Return: 0 = in flight, -EBUSY = engine busy (deferral),
+ * <0 = dropped (ring slot already released). */
+static int c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
+{
+    struct c985_audio *a = dev->audio_priv;
+    u32 bytes;
+    int ret;
+
+    if (!a || !a->running) {
+        dev_dbg(&dev->pdev->dev, "audio: desc dropped, not running\n");
+        c985_mbox_release_desc(dev, d);
+        return 0;
+    }
+
+    /* Class-4 (compressed audio) descriptor: addr = y_dw (DWORDS -> <<2 for
+     * bytes), size = chroma field in DWORDS (firmware reserved3), so -> <<2
+     * for byte length. Verified against the Windows class-4 record build
+     * (addrDWORDS=0x6B8, sizeDWORDS=0x6C0). */
+    bytes = d->chroma << 2;
+
+    if (d->y_dw == 0 || d->chroma == 0 || bytes > a->dma_size) {
+        dev_dbg(&dev->pdev->dev, "audio: bad desc addr=0x%x size_dw=%u\n",
+                d->y_dw, d->chroma);
+        atomic64_inc(&a->frames_dropped);
+        c985_mbox_release_desc(dev, d);
+        return -EINVAL;
+    }
+
+    /* Linear read (no frame geometry): card buffer addr << 2, size = bytes. */
+    a->op.dev = dev;
+    a->op.desc = *d;
+    a->op.linear = true;
+    a->op.card_addr = d->y_dw << 2;
+    a->op.len = bytes;
+    a->op.dst_phys = a->dma_phys;
+    a->op.done_cb = c985_audio_done;
+
+    ret = c985_dma_submit_linear(&a->op);
+    if (ret) {
+        dev_dbg(&dev->pdev->dev, "audio: async DMA submit failed: %d\n", ret);
+        if (ret == -EBUSY) {
+            /* Engine busy: defer, do NOT release the ring slot. */
+            return -EBUSY;
+        }
+        atomic64_inc(&a->frames_dropped);
+        c985_mbox_release_desc(dev, d);
+        return -EINVAL;
+    }
+
+    return 0;
 }
 
 /* ---- ALSA PCM capture callbacks ---- */
@@ -413,6 +457,12 @@ void c985_audio_cleanup(struct c985_dev *dev)
     dev->audio_consumer = NULL;
     a->running = false;
     wake_up_all(&a->wq);
+
+    /* An in-flight async linear DMA op holds dev->dma_cur_op pointing at
+     * a->op; flush the frame workqueue so the done_cb runs (and clears the
+     * slot) before we free the bounce buffer and the op's backing memory. */
+    if (dev->dma_frame_wq)
+        flush_workqueue(dev->dma_frame_wq);
 
     if (a->card)
         snd_card_free(a->card);

@@ -314,6 +314,55 @@ out:
     return ret;
 }
 
+/* Internal: build a single linear-read descriptor into a coherent host buffer
+ * and kick the engine. Does NOT wait for completion and does NOT take the
+ * lock. Returns 0 on submit, -EBUSY if engine busy. Audio (taskId1) path:
+ * Windows does linear reads (ctrl 0x0C02100F, swap=0, w=0 h=0, sync=0).
+ */
+static int c985_dma_read_linear_kick(struct c985_dev *dev, u32 card_addr,
+                                      dma_addr_t host_phys, u32 len)
+{
+    struct c985_dma_chan *chan = &dev->dma_chans[dev->dma_read_chan];
+    struct c985_dma_desc *desc;
+    dma_addr_t dpa;
+    u64 card_addr_full;
+
+    if (!chan->in_use)
+        return -EINVAL;
+    if (!chan->desc_ring) {
+        /* Shares the read channel's ring with the frame-mode (video) SG
+         * path, which needs a whole-frame chain (~800 descs). Allocate the
+         * full pool regardless of the current transfer's length. */
+        int ret = c985_dma_alloc_desc(dev, dev->dma_read_chan,
+                                      C985_DMA_NUM_DESCS);
+        if (ret)
+            return ret;
+    }
+    if (ioread32(chan->regs + C985_DMA_REG_CTRL) & C985_DMA_STATUS_BUSY)
+        return -EBUSY;
+    if ((ioread32(dev->bar0 + C985_DMA_GLOBAL_BASE + C985_DMA_GLOBAL_CTRL) & 1) == 0)
+        iowrite32(1, dev->bar0 + C985_DMA_GLOBAL_BASE + C985_DMA_GLOBAL_CTRL);
+
+    reinit_completion(&chan->done);
+
+    /* Linear read: base flag + end-of-chain bit59 on the (single) descriptor. */
+    card_addr_full = (u64)card_addr | C985_DMA_CARD_FLAG | C985_DMA_CARD_RD_END;
+
+    desc = chan->desc_ring;
+    desc->ctrl = cpu_to_le32(C985_DMA_CTRL_LIN_READ);
+    desc->len = cpu_to_le32(len);
+    desc->host_addr = cpu_to_le64(host_phys);
+    desc->card_addr = cpu_to_le64(card_addr_full);
+    desc->next_desc = cpu_to_le64(0);
+    wmb();
+
+    dpa = (chan->desc_ring_phys + 31) & ~31;
+    iowrite32(lower_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_LO);
+    iowrite32(upper_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_HI);
+    iowrite32(C985_DMA_CTRL_START, chan->regs + C985_DMA_REG_CTRL);
+    return 0;
+}
+
 /* Internal: build the SG descriptor chain for one frame-mode plane read and
  * kick the engine. Does NOT wait for completion and does NOT take the mutex —
  * the caller holds dev->dma_read_lock. Returns 0 on submit, -EBUSY if engine
@@ -477,6 +526,11 @@ void c985_dma_frame_next(struct c985_frame_op *op)
     if (op->failed)
         goto complete;
 
+    /* Linear (audio) op has a single transfer and no plane FSM: on DMA
+     * completion the ISR schedules us here with phase already terminal. */
+    if (op->linear)
+        goto complete;
+
     switch (op->phase) {
     case 0: /* Y done -> U */
         card = op->desc.u_dw << 2;
@@ -549,6 +603,44 @@ int c985_dma_submit_frame(struct c985_frame_op *op)
     if (ret) {
         /* Failed to kick Y: release the in-flight slot so the next frame
          * can be attempted. */
+        spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
+        dev->dma_cur_op = NULL;
+        spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
+        return ret;
+    }
+
+    return 0;
+}
+
+/* Submit a single linear (audio) read into the bounce buffer at op->dst_phys
+ * (a dma_alloc_coherent buffer, already DMA-mapped). Shares the single
+ * dma_cur_op in-flight slot with video frame ops. Returns -EBUSY if a
+ * video/audio transfer is still in flight; the caller must defer the
+ * descriptor. Completion: ISR schedules c985_dma_frame_work ->
+ * c985_dma_frame_next -> done_cb (op->linear short-circuits the plane FSM). */
+int c985_dma_submit_linear(struct c985_frame_op *op)
+{
+    struct c985_dev *dev = op->dev;
+    unsigned long flags;
+    int ret;
+
+    op->phase = 3;
+    op->failed = false;
+    INIT_WORK(&op->work, c985_dma_frame_work);
+
+    /* Claim the single in-flight slot before kicking the transfer. */
+    spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
+    if (dev->dma_cur_op) {
+        spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
+        return -EBUSY;
+    }
+    dev->dma_cur_op = op;
+    spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);
+
+    mutex_lock(&dev->dma_read_lock);
+    ret = c985_dma_read_linear_kick(dev, op->card_addr, op->dst_phys, op->len);
+    mutex_unlock(&dev->dma_read_lock);
+    if (ret) {
         spin_lock_irqsave(&dev->dma_cur_op_lock, flags);
         dev->dma_cur_op = NULL;
         spin_unlock_irqrestore(&dev->dma_cur_op_lock, flags);

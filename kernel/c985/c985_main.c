@@ -175,11 +175,8 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     /* v4l2/vb2 capture device */
     c985_v4l2_init(dev);
 
-    /* ALSA audio capture device.
-     * BRANCH async-interrupt-dma: audio is intentionally DISABLED so this
-     * branch focuses solely on async (interrupt/DPC) VIDEO. Re-enable here
-     * once video is verified and audio is reworked to async DMA. */
-    // c985_audio_init(dev);
+    /* ALSA audio capture device (async linear DMA, taskId 1). */
+    c985_audio_init(dev);
 
     pci_set_drvdata(pdev, dev);
 

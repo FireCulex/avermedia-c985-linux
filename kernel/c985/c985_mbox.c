@@ -601,9 +601,16 @@ void c985_mbox_drain_work_fn(struct work_struct *w)
     }
 
     if (d.task == C985_AUD_TASK) {
-        if (dev->audio_consumer)
-            dev->audio_consumer(dev, &d);
-        c985_mbox_release_desc(dev, &d);
+        if (dev->audio_consumer) {
+            int ar = dev->audio_consumer(dev, &d);
+            if (ar == -EBUSY) {
+                /* Engine busy: defer the descriptor; done_cb re-pumps. */
+                c985_mbox_fifo_push_front(dev, &d);
+                return;
+            }
+        }
+        /* On drop (<0) the audio layer already released the ring slot;
+         * on submit (0) the release happens in the async done_cb. */
         queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
         return;
     }
