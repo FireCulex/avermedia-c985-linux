@@ -451,6 +451,59 @@ bool c985_mbox_fifo_push_front(struct c985_dev *dev, struct c985_frame_desc *d)
     return ok;
 }
 
+/* Drop all queued descriptors: the FIFO is per-stream and must not carry a
+ * stale (stale ring_idx / already-dropped) descriptor from a previous stream
+ * into the next one. */
+void c985_mbox_fifo_reset(struct c985_dev *dev)
+{
+    struct c985_frame_fifo *f = &dev->frame_fifo;
+    unsigned long flags;
+
+    spin_lock_irqsave(&f->lock, flags);
+    f->head = 0;
+    f->tail = 0;
+    f->count = 0;
+    spin_unlock_irqrestore(&f->lock, flags);
+}
+
+/* Drain any pending ARM->host mailbox message WITHOUT checking dev->streaming.
+ * Used at teardown: the trailing teardown/status notification (opcode 0x50 etc.)
+ * arrives after stop_encoder and would otherwise latch 0x6C8 bit0 (DTM spins)
+ * across a restart. For each pending message we clear bit0 (unblock DTM); for a
+ * frame descriptor (0x40/0x41) we additionally release its firmware ring slot
+ * via 0x30 so the 4-slot ring is left clean for the next boot. Finally we clear
+ * the latched ARM->host doorbell. Returns the number of messages drained. */
+static bool c985_mbox_poll_desc(struct c985_dev *dev, struct c985_frame_desc *d);
+
+int c985_mbox_flush_pending(struct c985_dev *dev)
+{
+    struct c985_frame_desc d;
+    int drained = 0;
+
+    for (int i = 0; i < C985_FRAME_FIFO_DEPTH; i++) {
+        u32 status = c985_read_bar1(dev, C985_FROM_ARM_MSG_STATUS);
+
+        if (!(status & 1))
+            break;
+
+        if (c985_mbox_poll_desc(dev, &d)) {
+            /* Frame descriptor surfaced at teardown: release its ring slot. */
+            c985_mbox_release_desc(dev, &d);
+        }
+        /* Non-frame opcode (e.g. 0x50): poll_desc already cleared bit0. */
+        drained++;
+    }
+
+    /* Clear the latched ARM->host doorbell so a stale edge cannot re-wake the
+     * drain work on the next stream. */
+    if (c985_read_bar1(dev, C985_DOORBELL) & 0x01000000u)
+        c985_write_bar1(dev, C985_DOORBELL,
+                        c985_read_bar1(dev, C985_DOORBELL) & ~0x01000000u);
+    dev->doorbell_pending = false;
+
+    return drained;
+}
+
 /* ISR-side service: only WAKE the drain work. The actual mailbox read and
  * 0x6C8-bit0 clear is done by the drain work in process context (polling
  * 0x6C8 bit0), because the firmware's frame-notification doorbell has proven

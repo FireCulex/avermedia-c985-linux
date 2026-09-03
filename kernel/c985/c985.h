@@ -294,6 +294,7 @@ struct c985_dev {
     struct c985_frame_fifo frame_fifo;
     struct delayed_work mbox_drain_work;
     bool streaming;
+    bool streamed_once;     /* a capture session has run since module load */
     /* Frame consumer hook: called from mbox drain work with each popped
      * 0x40 descriptor. Set by the v4l2 layer (Phase 3/4). */
     int (*frame_consumer)(struct c985_dev *dev, struct c985_frame_desc *d);
@@ -379,6 +380,8 @@ void c985_mbox_release_desc(struct c985_dev *dev, const struct c985_frame_desc *
 bool c985_mbox_fifo_push(struct c985_dev *dev, struct c985_frame_desc *d);
 bool c985_mbox_fifo_pop(struct c985_dev *dev, struct c985_frame_desc *d);
 bool c985_mbox_fifo_push_front(struct c985_dev *dev, struct c985_frame_desc *d);
+void c985_mbox_fifo_reset(struct c985_dev *dev);
+int c985_mbox_flush_pending(struct c985_dev *dev);
 
 void c985_mbox_isr_service(struct c985_dev *dev);
 void c985_mbox_drain_work_fn(struct work_struct *w);

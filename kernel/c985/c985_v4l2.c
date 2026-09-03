@@ -235,6 +235,30 @@ static int c985_start_streaming(struct vb2_queue *q, unsigned int count)
 
     /* Called with q->lock held by vb2 core. */
 
+    /* On a re-stream (second and later streamon within one module/boot),
+     * re-initialize the firmware. The firmware spawns the video-input pump
+     * (VIU) only once per ARM boot, guarded by a one-shot latch that F3
+     * SystemClose does not clear; without a full re-init the second session
+     * has no producer and stalls after ~1 stale frame. Re-running the full
+     * firmware load (halt -> memory init -> re-upload -> release) resets the
+     * latch exactly like the module rebind that the proven test procedure
+     * requires before every stream. */
+    if (dev->streamed_once) {
+        ret = c985_firmware_load(dev);
+        if (ret) {
+            dev_err(&dev->pdev->dev, "firmware re-init for re-stream failed: %d\n",
+                    ret);
+            return ret;
+        }
+    }
+
+    /* Clear any state latched by a previous unclean stop BEFORE booting the
+     * encoder: a trailing teardown/status message can leave 0x6C8 bit0 set
+     * (DTM spins) and the ARM->host doorbell bit24 set, both of which would
+     * otherwise persist into this stream. Also drop any stale FIFO entries. */
+    c985_mbox_flush_pending(dev);
+    c985_mbox_fifo_reset(dev);
+
     ret = c985_v4l2_boot_encoder(dev);
     if (ret) {
         dev_err(&dev->pdev->dev, "encoder boot chain failed: %d\n", ret);
@@ -253,6 +277,7 @@ static int c985_start_streaming(struct vb2_queue *q, unsigned int count)
      * work -> frame_consumer / audio_consumer. No polling kthread. */
     dev->frame_consumer = c985_v4l2_frame_consume;
     dev->streaming = true;
+    dev->streamed_once = true;
 
     /* Kick the drain work once to start the poll loop (recovering from any
      * stale descriptor left in 0x6C8 by a previous unclean stop). */
@@ -285,6 +310,26 @@ static void c985_stop_streaming(struct vb2_queue *q)
     if (dev->dma_frame_wq)
         flush_workqueue(dev->dma_frame_wq);
 
+    /* Wait for any in-flight frame DMA to truly complete so dma_cur_op is
+     * released. Without this, a Y/U/V plane still transferring at stop time
+     * leaves dma_cur_op set and c985_dma_submit_frame returns -EBUSY forever
+     * on the next stream (the "1-2 frames then stall" symptom). Bounded to
+     * avoid spinning forever on a wedged engine. */
+    {
+        int wait = 0;
+
+        while (wait++ < 100 && READ_ONCE(dev->dma_cur_op)) {
+            flush_workqueue(dev->dma_frame_wq);
+            msleep(10);
+        }
+    }
+
+    /* Drain the trailing mailbox message(s) that arrive after stop_encoder
+     * (teardown/status opcode 0x50, etc.). These arrive after streaming was
+     * cleared, so the normal drain-work guard would never service them; leave
+     * them in place and they latch 0x6C8 bit0 + doorbell across restart. */
+    c985_mbox_flush_pending(dev);
+
     /* Stop audio task in lockstep. */
     if (dev->audio_priv)
         c985_audio_stop(dev);
@@ -300,6 +345,11 @@ static void c985_stop_streaming(struct vb2_queue *q)
     c985_v4l2_teardown(dev);
     if (dev->audio_priv)
         c985_audio_teardown(dev);
+
+    /* The 0x50 teardown/status notification is emitted during/after 0xF3
+     * SystemClose (teardown above). Flush it now (streaming already false) so
+     * nothing latches 0x6C8 bit0 or the doorbell into the next stream. */
+    c985_mbox_flush_pending(dev);
 }
 
 /* ---- Format / queue ioctls ---- */
