@@ -59,6 +59,12 @@ C985_DEVICE=/dev/video2 ./run_tests.sh      # Override device path
     - Verify writability first: `echo -n > /sys/kernel/debug/dynamic_debug/control`
   - Module built with `ccflags-y += -DDEBUG` always emits `dev_dbg` without dynamic_debug; prefer runtime `+p` to avoid rebuild.
 
+## Frame-Capture Quality Baseline (IMPORTANT)
+- **Perfect frame capture is unlikely on this card, even in Windows** — confirmed both by `test_sync.py` and by visual inspection in Avidemux, where the on-screen leader counter visibly skips `29→02` (missing `00/01`).
+- Windows 2-minute baseline (`windows_2min_sync_test.mp4`): 16 duplicate frames + 3 dropped, clustering roughly every 15.5s. Linux driver (30s captures): ~1–3 duplicates, 0 drops, on the same ~15.5s cadence.
+- Observed error rate: 0–0.5% of frames (duplicates + skips) per 2-minute capture, on both platforms.
+- Do NOT treat "zero dup / zero drop" as a driver correctness target. Both platforms show the same underlying firmware/encoder ~15.5s cadence (likely GOP/IDR boundary or ring-buffer recycle).
+
 ## Common Gotchas
 - `rmmod c985` fails "Module in use" if any process holds `/dev/video*` or ALSA devices — bind script kills holders
 - Stale module (rebuild without reload) detected via `srcversion` mismatch — bind script force-reloads

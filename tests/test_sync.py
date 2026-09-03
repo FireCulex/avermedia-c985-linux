@@ -196,6 +196,13 @@ def _indicator_toggle_onsets(path, x, y, fps, size=CROP_SIZE, white_thr=230):
     prev = False
     for i, b in enumerate(on):
         if b and not prev:
+            # Skip a triangle that is already lit on the first frame: this is
+            # the capture starting mid-signal (never saw a clean OFF), not a
+            # true rising edge. All three indicators must go black before
+            # events are counted.
+            if i == 0:
+                prev = b
+                continue
             onsets.append(i)
         prev = b
     return [t / fps for t in onsets]
@@ -264,11 +271,21 @@ def test_frame_pacing_no_drops_or_duplicates():
     fps = _probe_fps()
     dups, drops = _duplicate_and_dropped_info(VIDEO_PATH, fps)
 
+    pts = _read_pts("v")
+    n_frames = len(pts)
+    elapsed = (pts[-1] - pts[0]) if len(pts) > 1 else 0.0
+    n_dup = len(dups)
+    n_drop = sum(d for _, d in drops)
+    n_err = n_dup + n_drop
+    err_rate = n_err / n_frames if n_frames else 0.0
+
     print(f"\nframe pacing ({fps:.0f}fps)")
-    print(f"  duplicate frames (identical content): {len(dups)}")
+    print(f"  {n_dup} dup, {n_drop} drop over ~{elapsed:.0f}s / "
+          f"{n_frames} frames ~= {err_rate*100:.1f}% error rate")
+    print(f"  duplicate frames (identical content): {n_dup}")
     for t in dups:
         print(f"      {t:.3f}s")
-    print(f"  dropped frames (PTS gap): {sum(d for _, d in drops)}")
+    print(f"  dropped frames (PTS gap): {n_drop}")
     for t, d in drops:
         print(f"      {t:.3f}s  ({d} frame(s) dropped)")
 

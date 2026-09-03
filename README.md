@@ -181,6 +181,16 @@ PCIe → BAR0 (DMA) / BAR1 (Mailbox/ARM) → Firmware (QPSOS) → v4l2 → /dev/
 
 Video capture uses `vb2_dma_sg` (scatter-gather) with a 64-bit DMA mask. Each Y/U/V plane read walks the `sg_table` emitting one chained descriptor per SG element (`c985_dma_read_frame_mode_sg`). Buffer count is a hard 4 (firmware 4-slot ring).
 
+### Frame-Capture Quality Baseline
+
+Perfect frame capture is unlikely on this card, even in Windows — confirmed both by `test_sync.py` and by visual inspection in Avidemux, where the on-screen leader counter visibly skips `29→02` (missing `00/01`).
+
+- Windows 2-minute baseline (`windows_2min_sync_test.mp4`): 16 duplicate frames + 3 dropped, clustering roughly every 15.5s.
+- Linux driver (30s captures): ~1–3 duplicates, 0 drops, on the same ~15.5s cadence.
+- Observed error rate: 0–0.5% of frames (duplicates + skips) per 2-minute capture, on both platforms.
+
+Do not treat "zero dup / zero drop" as a driver correctness target. Both platforms show the same underlying firmware/encoder ~15.5s cadence (likely GOP/IDR boundary or ring-buffer recycle).
+
 ## Common Gotchas
 
 | Issue | Cause | Fix |
