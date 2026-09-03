@@ -165,35 +165,6 @@ struct c985_frame_desc {
     bool valid;
 };
 
-/*
- * One pending full-frame DMA op: three serial plane reads (Y, U, V)
- * sequenced by DMA completion, exactly matching the Windows driver's
- * "DMA serialized per direction" model (CTask_BuildIoBlockYUVMB2RAS).
- * done_cb fires once after all three planes + 0x30 release are complete.
- */
-struct c985_frame_op;
-typedef void (*c985_frame_done_t)(struct c985_frame_op *op);
-
-struct c985_frame_op {
-    struct list_head list;
-    struct c985_dev *dev;
-    struct c985_frame_desc desc;
-
-    /* DMA plane targets (set by submitter from a vb2 buffer or pool) */
-    dma_addr_t y_phys;
-    dma_addr_t u_phys;
-    dma_addr_t v_phys;
-    u32 y_len;          /* bytes */
-    u32 c_len;          /* chroma plane bytes (U and V) */
-    u32 width;          /* pixels (frame-mode geometry, /32 & /16) */
-
-    /* completion state machine */
-    u8 phase;           /* 0=Y, 1=U, 2=V */
-    struct work_struct work;   /* async completion work (scheduled from ISR) */
-    c985_frame_done_t done_cb;
-    bool failed;
-};
-
 /* Frame-mode DMA control words (asm-verified AVerPL33_x64.sys):
  * Y=0x08BE100F (mode1 fm1), U/V=0x4861000F (mode2 fm1) */
 #define C985_DMA_CTRL_FRAME_Y    0x08BE100F
@@ -236,7 +207,6 @@ struct c985_dev {
     struct c985_dma_chan dma_chans[64];
     int dma_write_chan;
     int dma_read_chan;
-    struct c985_frame_op *dma_cur_op; /* frame op whose plane is in flight */
 
     /* Interrupt handling */
     int irq;
@@ -252,7 +222,6 @@ struct c985_dev {
     atomic_t irq_bar1_700_count;
     atomic_t irq_bar1_e04_count;
     atomic_t irq_dma_count;
-    struct workqueue_struct *dma_frame_wq; /* DMA frame-op continuation */
     struct workqueue_struct *mbox_drain_wq; /* mailbox FIFO drain */
     wait_queue_head_t doorbell_wq;
     wait_queue_head_t mbox_wq;
@@ -339,11 +308,6 @@ int c985_dma_read_linear(struct c985_dev *dev, u32 card_addr,
 int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
                              dma_addr_t host_phys, u32 len,
                              u32 width, bool chroma);
-int c985_dma_read_frame_mode_submit(struct c985_dev *dev, u32 card_addr,
-                                    dma_addr_t host_phys, u32 len,
-                                    u32 width, bool chroma);
-int c985_dma_submit_frame(struct c985_frame_op *op);
-void c985_dma_frame_next(struct c985_frame_op *op);
 
 /* ARM control */
 int c985_qphci_init(struct c985_dev *dev);

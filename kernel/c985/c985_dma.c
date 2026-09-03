@@ -245,64 +245,6 @@ out:
     return ret;
 }
 
-/* --- Async frame-mode DMA: submit one plane WITHOUT waiting ---
- * Builds a single-descriptor frame-mode read and kicks the C2S engine.
- * Completion is signalled via the completion counter; the caller (frame op
- * state machine) advances to the next plane from the ISR-scheduled work.
- * Returns 0 submitted, -EBUSY if engine already busy, -EINVAL on bad state. */
-int c985_dma_read_frame_mode_submit(struct c985_dev *dev, u32 card_addr,
-                                    dma_addr_t host_phys, u32 len,
-                                    u32 width, bool chroma)
-{
-    struct c985_dma_chan *chan = &dev->dma_chans[dev->dma_read_chan];
-    struct c985_dma_desc *desc;
-    dma_addr_t dpa;
-    u32 ctrl = chroma ? C985_DMA_CTRL_FRAME_UV : C985_DMA_CTRL_FRAME_Y;
-    u64 offex;
-    int ret;
-
-    if (!chan->in_use)
-        return -EINVAL;
-    if (!chan->desc_ring) {
-        ret = c985_dma_alloc_desc(dev, dev->dma_read_chan, 2);
-        if (ret)
-            return ret;
-    }
-    if (ioread32(chan->regs + C985_DMA_REG_CTRL) & C985_DMA_STATUS_BUSY)
-        return -EBUSY;
-
-    if ((ioread32(dev->bar0 + C985_DMA_GLOBAL_BASE + C985_DMA_GLOBAL_CTRL) & 1) == 0)
-        iowrite32(1, dev->bar0 + C985_DMA_GLOBAL_BASE + C985_DMA_GLOBAL_CTRL);
-
-    reinit_completion(&chan->done);
-
-    /* CardOffsetEx geometry IDENTICAL to the verified c985_dma_read_frame_mode
-     * path. `width` is the EFFECTIVE plane width: full luma width for Y, HALF
-     * (luma/2) for chroma. byte[32-39] = plane raster stride in 64-bit words
-     * = width/32 (Y -> 1920/32=60, chroma -> 960/32=30), so the stride for a
-     * chroma plane is half that of luma. byte[40-47] = 16 (Y) / 8 (chroma),
-     * byte[56+] = DataSwap 3. */
-    offex = ((u64)(width / 32) << 32) |
-            ((u64)(chroma ? 8 : 16) << 40) |
-            ((u64)3 << 56);
-
-    desc = chan->desc_ring;
-    desc->ctrl = cpu_to_le32(ctrl);
-    desc->len = cpu_to_le32(len);
-    desc->host_addr = cpu_to_le64(host_phys);
-    desc->card_addr = cpu_to_le64((u64)card_addr | offex |
-                                  0x0800000000000000ULL);
-    desc->next_desc = cpu_to_le64(0);
-    wmb();
-
-    dpa = (chan->desc_ring_phys + 31) & ~31;
-    iowrite32(lower_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_LO);
-    iowrite32(upper_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_HI);
-    iowrite32(C985_DMA_CTRL_START, chan->regs + C985_DMA_REG_CTRL);
-
-    return 0;
-}
-
 /* Frame-mode (MB2RAS) read: engine converts macroblock-tiled card data to
  * raster in transfer. Geometry per PedDmaQueueBuffers mode 1/2:
  *   OffsetEx = (W/32)<<32 | c<<40 | 3<<56  (c=16 Y / 8 chroma, 3=DataSwap)
@@ -340,8 +282,11 @@ int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
 
     reinit_completion(&chan->done);
 
-    /* `width` is the effective plane width (full luma for Y, luma/2 for
-     * chroma); see c985_dma_read_frame_mode_submit for field decode. */
+    /* CardOffsetEx geometry: `width` is the EFFECTIVE plane width (full luma
+     * for Y, HALF luma/2 for chroma). byte[32-39] = plane raster stride in
+     * 64-bit words = width/32 (Y -> 1920/32=60, chroma -> 960/32=30), so the
+     * stride for a chroma plane is half that of luma. byte[40-47] = 16 (Y) /
+     * 8 (chroma), byte[56+] = DataSwap 3. */
     offex = ((u64)(width / 32) << 32) |
             ((u64)(chroma ? 8 : 16) << 40) |
             ((u64)3 << 56);
@@ -364,93 +309,4 @@ int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
 out:
     mutex_unlock(&dev->dma_read_lock);
     return ret;
-}
-
-/* --- Async full-frame DMA (Y -> U -> V serial, Windows model) ---
- *
- * c985_dma_submit_frame() starts the Y plane. The ISR, on DMA completion
- * for the read channel, calls c985_dma_frame_next() (below) which advances
- * through U then V and finally fires op->done_cb with all planes complete.
- *
- * Plane card addresses (DWORD -> byte, per descriptor CardAddr = dw<<2):
- *   Y = desc.y_dw << 2
- *   U = desc.u_dw << 2
- *   V = U + C985_V_OFFSET_BYTES (0x40)  [U+0x10 DWORDs, asm-verified]
- * }
- */
-
-/* Advance a frame op to its next plane, or complete it. Runs in process
- * context (workqueue) because plane submission may lazily allocate a
- * descriptor ring via dma_alloc_coherent (not hard-IRQ safe). */
-void c985_dma_frame_next(struct c985_frame_op *op)
-{
-    struct c985_dev *dev = op->dev;
-    u32 phys = 0, card = 0, len = 0;
-    bool chroma;
-    int ret;
-
-    if (op->failed)
-        goto complete;
-
-    switch (op->phase) {
-    case 0: /* Y done -> U */
-        phys = op->u_phys;
-        card = op->desc.u_dw << 2;
-        len = op->c_len;
-        chroma = true;
-        op->phase = 1;
-        break;
-    case 1: /* U done -> V */
-        phys = op->v_phys;
-        card = (op->desc.u_dw << 2) + C985_V_OFFSET_BYTES;
-        len = op->c_len;
-        chroma = true;
-        op->phase = 2;
-        break;
-    default:
-        goto complete;
-    }
-
-    ret = c985_dma_read_frame_mode_submit(dev, card, phys, len,
-                                          op->width, chroma);
-    if (ret) {
-        dev_err(&dev->pdev->dev,
-                "frame op: plane %d submit failed: %d\n", op->phase, ret);
-        op->failed = true;
-        goto complete;
-    }
-    dev->dma_cur_op = op;
-    return;
-
-complete:
-    dev->dma_cur_op = NULL;
-    if (op->done_cb)
-        op->done_cb(op);
-}
-
-static void c985_dma_frame_work(struct work_struct *w)
-{
-    struct c985_frame_op *op = container_of(w, struct c985_frame_op, work);
-    c985_dma_frame_next(op);
-}
-
-/* Submit a full frame. Starts the Y plane; subsequent planes are driven by
- * DMA completion (ISR schedules c985_dma_frame_work) via frame_next(). */
-int c985_dma_submit_frame(struct c985_frame_op *op)
-{
-    struct c985_dev *dev = op->dev;
-    int ret;
-
-    op->phase = 0;
-    op->failed = false;
-    INIT_WORK(&op->work, c985_dma_frame_work);
-
-    ret = c985_dma_read_frame_mode_submit(dev, op->desc.y_dw << 2,
-                                          op->y_phys, op->y_len,
-                                          op->width, false);
-    if (ret)
-        return ret;
-
-    dev->dma_cur_op = op;
-    return 0;
 }

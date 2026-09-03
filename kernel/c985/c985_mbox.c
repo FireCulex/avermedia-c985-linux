@@ -364,7 +364,7 @@ int c985_mbox_wait_and_read(struct c985_dev *dev, unsigned long timeout_ms)
  * the 7-word mailbox burst, clears 0x6C8 bit0 (unblock DTM), and if the
  * opcode is 0x40 pushes a c985_frame_desc onto the FIFO and schedules the
  * drain work. The drain work pops descriptors and hands each to the v4l2
- * layer (Phase 3/4) which builds a c985_frame_op and submits the Y/U/V DMA.
+ * layer, which renders the Y/U/V planes via synchronous frame-mode DMA.
  */
 
 bool c985_mbox_fifo_push(struct c985_dev *dev, struct c985_frame_desc *d)

@@ -41,15 +41,10 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     init_waitqueue_head(&dev->dma_wq);
     dev->doorbell_pending = false;
 
-    dev->dma_frame_wq = alloc_ordered_workqueue("c985-dma", 0);
-    if (!dev->dma_frame_wq) {
-        err = -ENOMEM;
-        goto err_regions;
-    }
     dev->mbox_drain_wq = alloc_ordered_workqueue("c985-mbox", 0);
     if (!dev->mbox_drain_wq) {
         err = -ENOMEM;
-        goto err_dma_wq;
+        goto err_regions;
     }
 
     spin_lock_init(&dev->frame_fifo.lock);
@@ -165,9 +160,6 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
              dev->irq, dev->msi_enabled, dev->msix_enabled);
     return 0;
 
-err_dma_wq:
-    destroy_workqueue(dev->dma_frame_wq);
-    dev->dma_frame_wq = NULL;
 err_regions:
     devm_free_irq(&pdev->dev, dev->irq, dev);
     pci_release_regions(pdev);
@@ -191,10 +183,6 @@ void c985_remove(struct pci_dev *pdev)
         cancel_work_sync(&dev->mbox_drain_work);
         destroy_workqueue(dev->mbox_drain_wq);
         dev->mbox_drain_wq = NULL;
-    }
-    if (dev->dma_frame_wq) {
-        destroy_workqueue(dev->dma_frame_wq);
-        dev->dma_frame_wq = NULL;
     }
 
     if (dev->frame_buf) {

@@ -203,11 +203,6 @@ irqreturn_t c985_isr(int irq, void *dev_id)
             handled = 1;
             atomic_inc(&dev->irq_dma_count);
             complete(&dev->dma_chans[i].done);
-            /* Async frame-mode read: advance Y/U/V state machine on the
-             * read channel's in-flight frame op (process context). */
-            if (i == dev->dma_read_chan && dev->dma_cur_op &&
-                dev->dma_frame_wq)
-                queue_work(dev->dma_frame_wq, &dev->dma_cur_op->work);
         }
     }
 
