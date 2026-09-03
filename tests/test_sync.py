@@ -8,6 +8,9 @@ panning pattern (right -> center -> left -> center, repeating). Each event
 fires a beep on the corresponding audio channel(s) and toggles an on-screen
 indicator at a known screen location.
 
+The leader itself is the A/V sync test video at
+https://www.youtube.com/watch?v=QzomK1fdSUg
+
 The container is produced by any capture tool (ffmpeg/obs/v4l2+arecord);
 the card and sudo are NOT required.
 
