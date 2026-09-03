@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * c985_v4l2.c - V4L2 capture device + videobuf2 (vb2_dma_contig) queue for
+ * c985_v4l2.c - V4L2 capture device + videobuf2 (vb2_dma_sg) queue for
  * the AverMedia C985 PCIe capture card.
  *
  * Architecture:
@@ -12,8 +12,10 @@
  *   (CompleteArm).
  *
  * Buffer model: one vb2_queue, V4L2_BUF_TYPE_VIDEO_CAPTURE (single-planar)
- * with one vb2_dma_contig buffer of C985_FRAME_BYTES holding YUV420p
+ * with one vb2_dma_sg buffer of C985_FRAME_BYTES holding YUV420p
  * (Y, then U, then V contiguous). OBS requires V4L2_CAP_VIDEO_CAPTURE.
+ * Scatter-gather (not contiguous) eliminates the order-10 DMA32 allocation
+ * failure that intermittently broke capture under memory fragmentation.
  */
 
 #include <linux/module.h>
@@ -22,7 +24,7 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
-#include <media/videobuf2-dma-contig.h>
+#include <media/videobuf2-dma-sg.h>
 
 #include "c985.h"
 
@@ -85,26 +87,28 @@ static void c985_v4l2_render_and_done(struct c985_v4l2 *c,
                                       const struct c985_frame_desc *d)
 {
     struct c985_dev *dev = c->dev;
-    dma_addr_t base;
+    struct sg_table *sgt;
     int rc = 0;
 
-    /* Single planar YUV420 buffer: Y then U then V contiguous. The three
-     * frame-mode DMAs land at offsets into the one vb2_dma_contig buffer. */
-    base = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+    /* Single planar YUV420 buffer: Y then U then V contiguous (in the buffer's
+     * virtual layout). With vb2_dma_sg the backing store is a scatterlist, so
+     * each plane read walks the sg_table from its byte offset, emitting one
+     * descriptor per SG element (Windows PedDmaQueueBuffers model). */
+    sgt = vb2_dma_sg_plane_desc(&buf->vb.vb2_buf, 0);
 
-    if (c985_dma_read_frame_mode(dev, d->y_dw << 2, base,
-                                 C985_Y_LEN, C985_WIDTH, false)) {
+    if (c985_dma_read_frame_mode_sg(dev, d->y_dw << 2, sgt, 0,
+                                    C985_Y_LEN, C985_WIDTH, false)) {
         rc = -1;
         goto out;
     }
-    if (c985_dma_read_frame_mode(dev, d->u_dw << 2, base + C985_Y_LEN,
-                                 C985_C_LEN, C985_WIDTH / 2, true)) {
+    if (c985_dma_read_frame_mode_sg(dev, d->u_dw << 2, sgt, C985_Y_LEN,
+                                    C985_C_LEN, C985_WIDTH / 2, true)) {
         rc = -1;
         goto out;
     }
-    if (c985_dma_read_frame_mode(dev, (d->u_dw << 2) + C985_V_OFFSET_BYTES,
-                                 base + C985_Y_LEN + C985_C_LEN,
-                                 C985_C_LEN, C985_WIDTH / 2, true))
+    if (c985_dma_read_frame_mode_sg(dev, (d->u_dw << 2) + C985_V_OFFSET_BYTES,
+                                    sgt, C985_Y_LEN + C985_C_LEN,
+                                    C985_C_LEN, C985_WIDTH / 2, true))
         rc = -1;
 
 out:
@@ -241,7 +245,8 @@ static int c985_queue_setup(struct vb2_queue *q,
 
     /* 2 buffers minimum; driver's 16-entry frame FIFO decouples from firmware's 4-slot ring.
      * 30fps = 33ms/frame; 2 buffers recycled every ~66ms feasible for DMA + userspace.
-     * Cap at 2 to avoid DMA32 contiguous allocation pressure (3.1MB/buffer). */
+     * Buffer count is a HARD 4 (firmware 4-slot ring); vb2_dma_sg removes the
+     * contiguous-allocation pressure that used to force low buffer counts. */
     if (*num_buffers < 4)
         *num_buffers = 4;
     if (*num_buffers > VIDEO_MAX_FRAME)
@@ -615,7 +620,7 @@ int c985_v4l2_init(struct c985_dev *dev)
     q->drv_priv = c;
     q->buf_struct_size = sizeof(struct c985_buf);
     q->ops = &c985_vb2_ops;
-    q->mem_ops = &vb2_dma_contig_memops;
+    q->mem_ops = &vb2_dma_sg_memops;
     q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
     q->min_queued_buffers = 2;
     q->lock = &c->q_lock;

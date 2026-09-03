@@ -160,7 +160,7 @@ PCIe → BAR0 (DMA) / BAR1 (Mailbox/ARM) → Firmware (QPSOS) → v4l2 → /dev/
 |------|---------|
 | `c985_main.c` | Probe/remove, core init |
 | `c985_v4l2.c` | V4L2/VB2 streaming interface |
-| `c985_dma.c` | PL330-style DMA engine, frame-mode reads |
+| `c985_dma.c` | PL330-style DMA engine, frame-mode reads (contiguous + scatter-gather) |
 | `c985_mbox.c` | Mailbox command/response + interrupt-driven frame FIFO |
 | `c985_irq.c` | MSI/MSI-X, PCIe/HCI/doorbell interrupt handling |
 | `c985_fw.c` | QPSOS firmware load (video + audio) |
@@ -178,7 +178,8 @@ PCIe → BAR0 (DMA) / BAR1 (Mailbox/ARM) → Firmware (QPSOS) → v4l2 → /dev/
 - No support for other AVerMedia models
 - Requires Clang/LLVM for build
 - Audio capture exposes raw AAC frames; userspace must decode (e.g., ffmpeg `-f alsa -i hw:X -f adts - | ffplay -f adts -`)
-- **UNRESOLVED DMA FRAGMENTATION BUG**: Video capture intermittently fails with "dma alloc of size 3112960 failed" (order-10 DMA32). Root cause: 4 vb2 buffers × 3.1MB contiguous = 12.4MB DMA32 needed; memory fragmentation leaves zero 4MB contiguous blocks. **Reducing buffer count to 2 breaks capture** (firmware needs 4-slot ring). OBS only supports packed `V4L2_PIX_FMT_YUV420` (YU12), not multi-planar `YUV420M` — multi-planar workaround blocked; scatter-gather (vb2_dma_sg with chained 4KB descriptors) remains viable but requires DMA path rewrite. See `c985_v4l2.c:243` `c985_queue_setup()`.
+
+Video capture uses `vb2_dma_sg` (scatter-gather) with a 64-bit DMA mask. Each Y/U/V plane read walks the `sg_table` emitting one chained descriptor per SG element (`c985_dma_read_frame_mode_sg`). Buffer count is a hard 4 (firmware 4-slot ring).
 
 ## Common Gotchas
 

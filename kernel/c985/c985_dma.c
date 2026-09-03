@@ -87,6 +87,7 @@ int c985_dma_alloc_desc(struct c985_dev *dev, int chan_id, int num_descs)
         return -ENOMEM;
 
     memset(chan->desc_ring, 0, size);
+    chan->desc_count = num_descs;
     dev_dbg(&dev->pdev->dev, "DMA[%d]: allocated %d descs at 0x%pad\n",
              chan_id, num_descs, &chan->desc_ring_phys);
     return 0;
@@ -96,10 +97,12 @@ void c985_dma_free_desc(struct c985_dev *dev, int chan_id)
 {
     struct c985_dma_chan *chan = &dev->dma_chans[chan_id];
     if (chan->desc_ring) {
-        dma_free_coherent(&dev->pdev->dev,
-                          2 * sizeof(struct c985_dma_desc) + C985_DMA_DESC_ALIGN,
-                          chan->desc_ring, chan->desc_ring_phys);
+        size_t size = chan->desc_count * sizeof(struct c985_dma_desc) +
+                      C985_DMA_DESC_ALIGN;
+        dma_free_coherent(&dev->pdev->dev, size, chan->desc_ring,
+                          chan->desc_ring_phys);
         chan->desc_ring = NULL;
+        chan->desc_count = 0;
     }
 }
 
@@ -268,7 +271,7 @@ int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
         goto out;
     }
     if (!chan->desc_ring) {
-        ret = c985_dma_alloc_desc(dev, dev->dma_read_chan, 2);
+        ret = c985_dma_alloc_desc(dev, dev->dma_read_chan, C985_DMA_NUM_DESCS);
         if (ret)
             goto out;
     }
@@ -307,6 +310,116 @@ int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
 
     ret = c985_dma_wait(dev, dev->dma_read_chan, 3000);
 out:
+    mutex_unlock(&dev->dma_read_lock);
+    return ret;
+}
+
+/* Scatter-gather frame-mode read. Identical geometry/control to the
+ * contiguous c985_dma_read_frame_mode, but instead of a single host DMA
+ * address it walks a vb2_dma_sg sg_table starting at `offset` bytes and emits
+ * ONE chained descriptor per SG element — exactly the Windows PedDmaQueueBuffers
+ * model (each SGL fragment becomes its own descriptor, linked via next_desc).
+ *
+ * card_addr is the plane base (DWORD<<2, per c985_dma_read_frame_mode); it is
+ * advanced by each element's transferred byte count. Only the LAST descriptor
+ * carries the bit59 end-of-chain marker and next_desc=0.
+ */
+int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
+                                struct sg_table *sgt, u32 offset, u32 len,
+                                u32 width, bool chroma)
+{
+    struct c985_dma_chan *chan = &dev->dma_chans[dev->dma_read_chan];
+    struct c985_dma_desc *desc;
+    struct scatterlist *sg;
+    dma_addr_t dpa;
+    u32 ctrl = chroma ? 0x4861000F : 0x08BE100F;
+    u64 offex;
+    u32 card_cur = card_addr, remaining = len, in_elem;
+    int ndesc = 0, ret;
+
+    if (!sgt || !sgt->sgl)
+        return -EINVAL;
+
+    mutex_lock(&dev->dma_read_lock);
+
+    if (!chan->in_use) {
+        ret = -EINVAL;
+        goto out;
+    }
+    if (!chan->desc_ring) {
+        ret = c985_dma_alloc_desc(dev, dev->dma_read_chan, C985_DMA_NUM_DESCS);
+        if (ret)
+            goto out;
+    }
+    if (ioread32(chan->regs + C985_DMA_REG_CTRL) & C985_DMA_STATUS_BUSY) {
+        ret = -EBUSY;
+        goto out;
+    }
+    if ((ioread32(dev->bar0 + C985_DMA_GLOBAL_BASE + C985_DMA_GLOBAL_CTRL) & 1) == 0)
+        iowrite32(1, dev->bar0 + C985_DMA_GLOBAL_BASE + C985_DMA_GLOBAL_CTRL);
+
+    reinit_completion(&chan->done);
+
+    offex = ((u64)(width / 32) << 32) |
+            ((u64)(chroma ? 8 : 16) << 40) |
+            ((u64)3 << 56);
+
+    /* Advance to the SG element that contains the plane's starting offset. */
+    sg = sgt->sgl;
+    while (sg_dma_len(sg) > 0 && offset >= (u32)sg_dma_len(sg)) {
+        offset -= (u32)sg_dma_len(sg);
+        sg = sg_next(sg);
+        if (!sg)
+            goto bad_len;
+    }
+    in_elem = offset;
+
+    desc = chan->desc_ring;
+    dpa = (chan->desc_ring_phys + 31) & ~31;
+
+    while (remaining && sg) {
+        u32 seglen = (u32)sg_dma_len(sg) - in_elem;
+        u32 n = min(seglen, remaining);
+        bool last;
+
+        if (ndesc >= C985_DMA_NUM_DESCS)
+            goto bad_len;
+
+        last = (n == remaining);
+
+        desc[ndesc].ctrl = cpu_to_le32(ctrl);
+        desc[ndesc].len = cpu_to_le32(n);
+        desc[ndesc].host_addr = cpu_to_le64(sg_dma_address(sg) + in_elem);
+        desc[ndesc].card_addr = cpu_to_le64((u64)card_cur | offex |
+                                            (last ? 0x0800000000000000ULL : 0));
+        desc[ndesc].next_desc = cpu_to_le64(last ? 0 :
+                                             dpa + (ndesc + 1) * sizeof(*desc));
+
+        card_cur += n;
+        remaining -= n;
+        in_elem = 0;
+        ndesc++;
+        sg = sg_next(sg);
+    }
+
+    if (remaining)
+        goto bad_len;
+
+    wmb();
+    iowrite32(lower_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_LO);
+    iowrite32(upper_32_bits(dpa), chan->regs + C985_DMA_REG_DESC_HI);
+    iowrite32(C985_DMA_CTRL_START, chan->regs + C985_DMA_REG_CTRL);
+
+    ret = c985_dma_wait(dev, dev->dma_read_chan, 3000);
+out:
+    mutex_unlock(&dev->dma_read_lock);
+    return ret;
+
+bad_len:
+    dev_err(&dev->pdev->dev,
+            "DMA SG: sg_table too short for offset=%u len=%u (ndesc=%d)\n",
+            offset + (u32)(len - remaining), len, ndesc);
+    ret = -EINVAL;
     mutex_unlock(&dev->dma_read_lock);
     return ret;
 }

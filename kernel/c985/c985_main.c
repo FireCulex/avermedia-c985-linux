@@ -69,6 +69,24 @@ int c985_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         return err;
     }
 
+    /* The C985 is a 64-bit-capable PCIe device (Windows PedDmaInit selects
+     * m_64BitAddress / 64-bit BAR transfer types). Without an explicit DMA
+     * mask the kernel leaves the 32-bit default, which routes every
+     * scatter-gather map through the 64MB swiotlb bounce pool and fills it
+     * ("swiotlb buffer is full" -> capture stalls at 0 frames). Set a 64-bit
+     * streaming + coherent mask, falling back to 32-bit only if the hardware
+     * refuses (required for the FB-DIMM/DMA engine 64-bit support). */
+    err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+    if (err) {
+        dev_info(&pdev->dev,
+                 "64-bit DMA not supported (%d), trying 32-bit\n", err);
+        err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+        if (err) {
+            dev_err(&pdev->dev, "DMA mask setup failed: %d\n", err);
+            return err;
+        }
+    }
+
     err = pci_request_regions(pdev, "c985");
     if (err) {
         dev_err(&pdev->dev, "pci_request_regions failed: %d\n", err);

@@ -16,6 +16,7 @@
 #include <linux/delay.h>
 #include <linux/list.h>
 #include <linux/workqueue.h>
+#include <linux/scatterlist.h>
 
 #define C985_VENDOR 0x1AF2
 #define C985_DEVICE 0xA001
@@ -34,6 +35,11 @@
 #define C985_DMA_STATUS_DONE    0x03    /* Bits 0|1 = transfer complete (W1C ack) */
 #define C985_DMA_CTRL_START     0x101   /* Start DMA */
 #define C985_DMA_DESC_ALIGN     32
+
+/* Per-engine descriptor pool size. Matches Windows PedDmaInit@0xB8460, which
+ * does NumDescriptors = 0x1002 (4098) and AllocateCommonBuffer(4098*0x20+0x20).
+ * Covers a whole-frame 4KB-granular SG chain (~800 elements) with ample headroom. */
+#define C985_DMA_NUM_DESCS      4098
 
 /* Descriptor control words (AVerPL33_x64.sys PedDmaQueueBuffers@0xB8C60):
  * mode 3 linear read vs default linear write */
@@ -129,6 +135,7 @@ struct c985_dma_chan {
     struct c985_dma_desc *desc_ring;
     dma_addr_t desc_ring_phys;
     int chan_id;
+    int desc_count;
     struct completion done;
     bool in_use;
 };
@@ -308,6 +315,12 @@ int c985_dma_read_linear(struct c985_dev *dev, u32 card_addr,
 int c985_dma_read_frame_mode(struct c985_dev *dev, u32 card_addr,
                              dma_addr_t host_phys, u32 len,
                              u32 width, bool chroma);
+/* Scatter-gather frame-mode read: walks a vb2_dma_sg sg_table starting at
+ * `offset` bytes, emitting one chained descriptor per SG element. Replaces the
+ * contiguous-buffer path to remove the order-10 DMA32 fragmentation failure. */
+int c985_dma_read_frame_mode_sg(struct c985_dev *dev, u32 card_addr,
+                                struct sg_table *sgt, u32 offset, u32 len,
+                                u32 width, bool chroma);
 
 /* ARM control */
 int c985_qphci_init(struct c985_dev *dev);

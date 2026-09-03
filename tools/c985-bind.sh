@@ -122,7 +122,7 @@ case "${1:-}" in
 
     # Load videobuf2/v4l2 dependencies (in-kernel driver is a v4l2 capture
     # device now; insmod cannot resolve these symbol deps by itself)
-    for m in videobuf2-common videobuf2-memops videobuf2-dma-contig videobuf2-v4l2; do
+    for m in videobuf2-common videobuf2-memops videobuf2-dma-sg videobuf2-v4l2; do
         if ! lsmod | grep -q "^$m "; then
             modprobe "$m" 2>/dev/null || true
         fi
