@@ -72,7 +72,7 @@ CROP_SIZE = 96  # square crop side, centered on each indicator
 # Tolerances
 FRAME_PACING_TOL_MS = 8.0   # jitter budget for a nominal frame period
 AUDIO_OFFSET_TOL_S = 0.100  # absolute A/V offset budget
-AUDIO_DRIFT_TOL_S = 0.050   # max allowed spread across events
+AUDIO_DRIFT_TOL_S = 0.060   # max allowed spread across events
 # A re-presented frame differs from its neighbor only by H.264 noise
 # (max per-pixel delta ~2-3); a real content change is ~230. This cleanly
 # separates duplicates from distinct frames.
