@@ -5,11 +5,13 @@
  *
  * Architecture:
  *   start_streaming boots the encoder (polling mbox: F1/F2/six 0x10/0x01)
- *   and starts a kthread (c985_v4l2_thread). The thread polls the mailbox
- *   (0x6C8 bit0) continuously, reads each 0x40 frame descriptor, does three
- *   synchronous frame-mode DMA reads (Y, U, V=U+0x40) into the next queued
- *   vb2 buffer, DQBUFs it, and releases the card ring slot via 0x30
- *   (CompleteArm).
+ *   and registers interrupt-driven consumers. The ISR detects the ARM->host
+ *   doorbell (bit24), reads the 0x40 frame descriptor, pushes it onto the
+ *   mailbox FIFO, and the drain work calls frame_consumer (video) /
+ *   audio_consumer (audio). frame_consumer claims a queued vb2 buffer and
+ *   kicks an ASYNCHRONOUS Y/U/V frame-mode DMA (each plane advanced by the
+ *   DMA-completion ISR); completion hands the buffer to vb2 and releases the
+ *   card ring slot via 0x30 (CompleteArm). No polling kthread.
  *
  * Buffer model: one vb2_queue, V4L2_BUF_TYPE_VIDEO_CAPTURE (single-planar)
  * with one vb2_dma_sg buffer of C985_FRAME_BYTES holding YUV420p
@@ -20,7 +22,6 @@
 
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/kthread.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -43,22 +44,26 @@ struct c985_v4l2 {
     struct list_head ready;
     unsigned int queued_count;
 
-    /* streaming kthread */
-    struct task_struct *thread;
-    bool thread_stop;             /* set to request thread exit */
-
     /* stats */
     atomic64_t frames_done;
     atomic64_t frames_dropped;
     atomic64_t desc_non40;     /* 0x40 polling but msg != 0x40 */
     atomic64_t desc_bad;       /* 0x40 but zero addrs */
     atomic64_t no_buf;         /* 0x40 valid but no queued vb2 buffer */
+
+    /* Monotonic timestamp clamp: last emitted buffer timestamp (ns). The
+     * firmware PTS stalls/repeats and is not a reliable presentation clock,
+     * so we stamp the host clock but clamp forward by one nominal frame
+     * period so serial-DMA jitter / a stalled frame cannot collapse two
+     * distinct buffers onto the same presentation slot (non-monotonic PTS). */
+    u64 host_prev_ns;
 };
 
 /* Per-vb2-buffer driver state, embedded ahead of vb2_v4l2_buffer. */
 struct c985_buf {
     struct vb2_v4l2_buffer vb;
     struct list_head list;
+    struct c985_frame_op op;   /* async Y/U/V DMA op for this buffer */
 };
 
 static inline struct c985_buf *to_c985_buf(struct vb2_buffer *vb2)
@@ -79,131 +84,94 @@ static struct c985_buf *c985_v4l2_next_buf(struct c985_v4l2 *c)
     return buf;
 }
 
-/* Render one descriptor into one buffer: 3 synchronous frame-mode DMA reads
- * (Y, U, V=U+0x40), then DQBUFs.
- * Caller holds q_lock for list access but we drop it around the (slow) DMA. */
-static void c985_v4l2_render_and_done(struct c985_v4l2 *c,
-                                      struct c985_buf *buf,
-                                      const struct c985_frame_desc *d)
+/* Async completion callback: fired by c985_dma_frame_next() (workqueue
+ * context) after all three planes (Y/U/V) have been DMA'd. Wraps the buffer
+ * to vb2 and releases the firmware ring slot. */
+static void c985_v4l2_frame_done(struct c985_frame_op *op)
 {
-    struct c985_dev *dev = c->dev;
-    struct sg_table *sgt;
-    int rc = 0;
+    struct c985_buf *buf = container_of(op, struct c985_buf, op);
+    struct c985_v4l2 *c = buf->vb.vb2_buf.vb2_queue->drv_priv;
+    struct c985_dev *dev = op->dev;
 
-    /* Single planar YUV420 buffer: Y then U then V contiguous (in the buffer's
-     * virtual layout). With vb2_dma_sg the backing store is a scatterlist, so
-     * each plane read walks the sg_table from its byte offset, emitting one
-     * descriptor per SG element (Windows PedDmaQueueBuffers model). */
-    sgt = vb2_dma_sg_plane_desc(&buf->vb.vb2_buf, 0);
+    /* Timestamp: strictly monotonic host clock. The firmware per-frame PTS is
+     * NOT a reliable presentation clock (it stalls/repeats: witnessed as
+     * ffmpeg "non-strictly-monotonic PTS" + a frozen -t clock). Stamp
+     * CLOCK_MONOTONIC but clamp forward by one nominal frame period vs the
+     * previously emitted timestamp so completion jitter or a stalled frame
+     * cannot emit a backwards/duplicate presentation time. */
+    {
+        u64 now = ktime_get_ns();
+        u64 min = c->host_prev_ns ? c->host_prev_ns + NSEC_PER_SEC / 30 : 0;
+        u64 ts = now > min ? now : min;
 
-    if (c985_dma_read_frame_mode_sg(dev, d->y_dw << 2, sgt, 0,
-                                    C985_Y_LEN, C985_WIDTH, false)) {
-        rc = -1;
-        goto out;
+        c->host_prev_ns = ts;
+        buf->vb.vb2_buf.timestamp = ts;
     }
-    if (c985_dma_read_frame_mode_sg(dev, d->u_dw << 2, sgt, C985_Y_LEN,
-                                    C985_C_LEN, C985_WIDTH / 2, true)) {
-        rc = -1;
-        goto out;
-    }
-    if (c985_dma_read_frame_mode_sg(dev, (d->u_dw << 2) + C985_V_OFFSET_BYTES,
-                                    sgt, C985_Y_LEN + C985_C_LEN,
-                                    C985_C_LEN, C985_WIDTH / 2, true))
-        rc = -1;
-
-out:
-    buf->vb.vb2_buf.timestamp = ktime_get_ns();
     buf->vb.sequence = (u32)atomic64_inc_return(&c->frames_done);
     vb2_set_plane_payload(&buf->vb.vb2_buf, 0, C985_FRAME_BYTES);
     vb2_buffer_done(&buf->vb.vb2_buf,
-                    rc ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
+                    op->failed ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
+
+    if (op->failed)
+        atomic64_inc(&c->frames_dropped);
+
+    /* Release the card ring slot (0x30 CompleteArm). */
+    c985_mbox_release_desc(dev, &op->desc);
+
+    /* Engine is free again: pump the mailbox drain work so any queued 0x40
+     * descriptor waiting in the FIFO is picked up. */
+    queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
 }
 
-/* Streaming kthread: blocks on the doorbell waitqueue (woken by the ISR on ARM->host
- * doorbell bit24), reads the mailbox burst, renders into the next queued
- * buffer, and releases the card ring slot via 0x30. */
-static int c985_v4l2_thread(void *data)
+/* frame_consumer: called from the mailbox drain work (process context) for
+ * each video (taskId 0) 0x40 frame descriptor. Claims the next queued vb2
+ * buffer and kicks the asynchronous Y/U/V DMA; completion (done_cb) drives
+ * buffer handoff + ring release. Mirrors Windows CTask_ProcessDataStreaming.
+ *
+ * Return: 0 = submitted (in flight), -EBUSY = engine busy (caller must re-push
+ * the descriptor to the FIFO front for deferral), <0 = dropped (ring released,
+ * caller must re-pump). */
+static int c985_v4l2_frame_consume(struct c985_dev *dev,
+                                   struct c985_frame_desc *d)
 {
-    struct c985_v4l2 *c = data;
-    struct c985_dev *dev = c->dev;
-    struct c985_frame_desc d;
+    struct c985_v4l2 *c = dev->v4l2_priv;
+    struct c985_buf *buf;
 
-    while (!kthread_should_stop() && !READ_ONCE(c->thread_stop)) {
-        struct c985_buf *buf;
-        struct c985_mbox_result *r;
-        int ret;
+    if (!c)
+        return -EINVAL;
 
-        /* Poll the mailbox (0x6C8 bit0) directly, consume any pending 0x40 frame
-         * descriptor, render, and 0x30-release. No doorbell wait — the
-         * descriptor is the source of truth. */
-        ret = c985_mbox_drain(dev);
-        if (ret < 0 && ret != -ENODATA)
-            break;
-        if (ret == -ENODATA) {
-            usleep_range(1000, 2000);
-            continue;
-        }
+    if (d->y_dw == 0 || d->u_dw == 0 || d->chroma == 0) {
+        atomic64_inc(&c->desc_bad);
+        c985_mbox_release_desc(dev, d);
+        return -EINVAL;
+    }
 
-        r = &dev->last_mbox;
+    if (mutex_lock_interruptible(&c->q_lock))
+        return -EINVAL;
+    buf = c985_v4l2_next_buf(c);
+    mutex_unlock(&c->q_lock);
+    if (!buf) {
+        atomic64_inc(&c->no_buf);
+        /* No host buffer: still release the ring slot so firmware doesn't
+         * stall; the frame is lost. */
+        c985_mbox_release_desc(dev, d);
+        return -EINVAL;
+    }
 
-        /* Only raw-video 0x40 descriptors feed the capture path. */
-        if ((r->from_arm_msg & 0xFF) != 0x40) {
-            atomic64_inc(&c->desc_non40);
-            continue;
-        }
+    buf->op.dev = dev;
+    buf->op.desc = *d;
+    buf->op.sgt = vb2_dma_sg_plane_desc(&buf->vb.vb2_buf, 0);
+    buf->op.done_cb = c985_v4l2_frame_done;
 
-        /* Route audio-task (taskId 1) descriptors to the audio consumer. */
-        if (((r->from_arm_msg >> 16) & 0xFF) == C985_AUD_TASK) {
-            struct c985_frame_desc ad;
-            ad.tag = r->resp_params[0] & 0xFFFF;
-            ad.ring_idx = (r->resp_params[0] >> 24) & 0xFF;
-            ad.y_dw = r->resp_params[1];
-            ad.u_dw = r->resp_params[2];
-            ad.chroma = r->resp_params[3];
-            ad.pts_raw = r->resp_params[4];
-            ad.task = C985_AUD_TASK;
-            ad.valid = true;
-            if (dev->audio_consumer)
-                dev->audio_consumer(dev, &ad);
-            c985_mbox_release_last(dev);
-            continue;
-        }
-
-        d.tag = r->resp_params[0] & 0xFFFF;
-        d.ring_idx = (r->resp_params[0] >> 24) & 0xFF;
-        d.y_dw = r->resp_params[1];
-        d.u_dw = r->resp_params[2];
-        d.chroma = r->resp_params[3];
-        d.pts_raw = r->resp_params[4];
-        d.valid = true;
-
-        if (d.y_dw == 0 || d.u_dw == 0 || d.chroma == 0) {
-            atomic64_inc(&c->desc_bad);
-            continue;
-        }
-
-        /* Re-check stop before touching q_lock; stop_streaming holds q_lock
-         * while joining us, so a blocking lock here would deadlock. */
-        if (kthread_should_stop() || READ_ONCE(c->thread_stop))
-            break;
-
-        /* Interruptible: kthread_stop() (during stop_streaming, which holds
-         * q_lock) signals the thread; a plain mutex_lock would deadlock
-         * against stop_streaming -> kthread_stop waiting for us while we
-         * wait on q_lock. */
-        if (mutex_lock_interruptible(&c->q_lock))
-            break;
-        buf = c985_v4l2_next_buf(c);
+    if (c985_dma_submit_frame(&buf->op)) {
+        /* Engine busy (another frame in flight): give the buffer back to the
+         * ready list and defer the descriptor — do NOT release the ring slot
+         * (the frame is not lost, just delayed). */
+        mutex_lock(&c->q_lock);
+        list_add(&buf->list, &c->ready);
+        c->queued_count++;
         mutex_unlock(&c->q_lock);
-        if (!buf) {
-            atomic64_inc(&c->no_buf);
-            continue;
-        }
-
-        c985_v4l2_render_and_done(c, buf, &d);
-
-        /* Release the card ring slot. */
-        c985_mbox_release_last(dev);
+        return -EBUSY;
     }
 
     return 0;
@@ -287,6 +255,30 @@ static int c985_start_streaming(struct vb2_queue *q, unsigned int count)
 
     /* Called with q->lock held by vb2 core. */
 
+    /* On a re-stream (second and later streamon within one module/boot),
+     * re-initialize the firmware. The firmware spawns the video-input pump
+     * (VIU) only once per ARM boot, guarded by a one-shot latch that F3
+     * SystemClose does not clear; without a full re-init the second session
+     * has no producer and stalls after ~1 stale frame. Re-running the full
+     * firmware load (halt -> memory init -> re-upload -> release) resets the
+     * latch exactly like the module rebind that the proven test procedure
+     * requires before every stream. */
+    if (dev->streamed_once) {
+        ret = c985_firmware_load(dev);
+        if (ret) {
+            dev_err(&dev->pdev->dev, "firmware re-init for re-stream failed: %d\n",
+                    ret);
+            return ret;
+        }
+    }
+
+    /* Clear any state latched by a previous unclean stop BEFORE booting the
+     * encoder: a trailing teardown/status message can leave 0x6C8 bit0 set
+     * (DTM spins) and the ARM->host doorbell bit24 set, both of which would
+     * otherwise persist into this stream. Also drop any stale FIFO entries. */
+    c985_mbox_flush_pending(dev);
+    c985_mbox_fifo_reset(dev);
+
     ret = c985_v4l2_boot_encoder(dev);
     if (ret) {
         dev_err(&dev->pdev->dev, "encoder boot chain failed: %d\n", ret);
@@ -301,14 +293,18 @@ static int c985_start_streaming(struct vb2_queue *q, unsigned int count)
     /* Reset the mailbox wait state (doorbell may be stale from boot). */
     dev->doorbell_pending = false;
 
-    c->thread_stop = false;
-    c->thread = kthread_run(c985_v4l2_thread, c, "c985-v4l2");
-    if (IS_ERR(c->thread)) {
-        dev_err(&dev->pdev->dev, "failed to start v4l2 thread: %ld\n",
-                PTR_ERR(c->thread));
-        c->thread = NULL;
-        return PTR_ERR(c->thread);
-    }
+    /* Fresh stream: reset the monotonic timestamp clamp base. */
+    c->host_prev_ns = 0;
+
+    /* Register the interrupt-driven consumers: ISR -> mbox FIFO -> drain
+     * work -> frame_consumer / audio_consumer. No polling kthread. */
+    dev->frame_consumer = c985_v4l2_frame_consume;
+    dev->streaming = true;
+    dev->streamed_once = true;
+
+    /* Kick the drain work once to start the poll loop (recovering from any
+     * stale descriptor left in 0x6C8 by a previous unclean stop). */
+    queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
 
     return 0;
 }
@@ -321,16 +317,41 @@ static void c985_stop_streaming(struct vb2_queue *q)
 
     /* Called with q->lock held by vb2 core. */
 
-    /* Stop the streaming thread first; wake it if it is sleeping. */
-    if (c->thread) {
-        c->thread_stop = true;
-        wake_up_all(&dev->doorbell_wq);
-        kthread_stop(c->thread);
-        c->thread = NULL;
+    /* Unregister consumers first so no new frames are claimed. */
+    dev->frame_consumer = NULL;
+    dev->streaming = false;
+
+    /* Halt the encoder FIRST: clears the firmware run-flag so no new 0x40
+     * descriptors arrive while we drain. */
+    c985_v4l2_stop_encoder(dev);
+
+    /* Cancel any pending delayed drain (poll re-arm) and flush in-flight DMA
+     * continuation + mailbox drain work so any queued completion fires
+     * done_cb and returns its buffer to vb2. */
+    cancel_delayed_work_sync(&dev->mbox_drain_work);
+    flush_workqueue(dev->mbox_drain_wq);
+    if (dev->dma_frame_wq)
+        flush_workqueue(dev->dma_frame_wq);
+
+    /* Wait for any in-flight frame DMA to truly complete so dma_cur_op is
+     * released. Without this, a Y/U/V plane still transferring at stop time
+     * leaves dma_cur_op set and c985_dma_submit_frame returns -EBUSY forever
+     * on the next stream (the "1-2 frames then stall" symptom). Bounded to
+     * avoid spinning forever on a wedged engine. */
+    {
+        int wait = 0;
+
+        while (wait++ < 100 && READ_ONCE(dev->dma_cur_op)) {
+            flush_workqueue(dev->dma_frame_wq);
+            msleep(10);
+        }
     }
 
-    /* Stop encoder (0x02), drop 0x40 traffic (fw run-flag clear). */
-    c985_v4l2_stop_encoder(dev);
+    /* Drain the trailing mailbox message(s) that arrive after stop_encoder
+     * (teardown/status opcode 0x50, etc.). These arrive after streaming was
+     * cleared, so the normal drain-work guard would never service them; leave
+     * them in place and they latch 0x6C8 bit0 + doorbell across restart. */
+    c985_mbox_flush_pending(dev);
 
     /* Stop audio task in lockstep. */
     if (dev->audio_priv)
@@ -347,6 +368,11 @@ static void c985_stop_streaming(struct vb2_queue *q)
     c985_v4l2_teardown(dev);
     if (dev->audio_priv)
         c985_audio_teardown(dev);
+
+    /* The 0x50 teardown/status notification is emitted during/after 0xF3
+     * SystemClose (teardown above). Flush it now (streaming already false) so
+     * nothing latches 0x6C8 bit0 or the doorbell into the next stream. */
+    c985_mbox_flush_pending(dev);
 }
 
 /* ---- Format / queue ioctls ---- */
@@ -607,6 +633,7 @@ int c985_v4l2_init(struct c985_dev *dev)
     atomic64_set(&c->desc_non40, 0);
     atomic64_set(&c->desc_bad, 0);
     atomic64_set(&c->no_buf, 0);
+    c->host_prev_ns = 0;
 
     snprintf(c->v4l2_dev.name, sizeof(c->v4l2_dev.name), "%s-%s",
              "c985", pci_name(dev->pdev));
@@ -665,12 +692,7 @@ void c985_v4l2_cleanup(struct c985_dev *dev)
     if (!c)
         return;
 
-    if (c->thread) {
-        c->thread_stop = true;
-        wake_up_all(&dev->doorbell_wq);
-        kthread_stop(c->thread);
-        c->thread = NULL;
-    }
+    dev->frame_consumer = NULL;
 
     video_unregister_device(&c->vdev);
     v4l2_device_unregister(&c->v4l2_dev);

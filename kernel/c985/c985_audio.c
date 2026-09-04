@@ -2,18 +2,18 @@
 /*
  * c985_audio.c - ALSA audio capture for the AVerMedia C985.
  *
- * The card's native record format is MPEG4 (H.264 + AAC): the audio task
- * (taskId 1, function 0x80000040) emits AAC-LC frames (@48kHz/128kbps/
- * stereo in the reference OBS session). Those frames are delivered on the
- * same 0x40/0x41 EncDataOutReq mailbox descriptor as video, tagged with
- * taskId=1 in the upper 16 bits of 0x6B0, and are DMA-read LINEARLY
- * (ctrl 0x0804200F, no frame geometry) in 1536..4608 byte chunks.
+ * The audio task (taskId 1, function 0x80000040) emits raw LPCM S16_LE
+ * interleaved stereo (48kHz) — audio_type=0 in EncAudioControlParam (0x6D4)
+ * is LPCM-ex bypass, with EncAudioControlExLPCM=0x480 (1152-sample
+ * frames = 4608 bytes). Frames are delivered on the same 0x40/0x41
+ * EncDataOutReq mailbox descriptor as video, tagged with taskId=1 in the
+ * upper 16 bits of 0x6B0, and are DMA-read LINEARLY (ctrl 0x0804200F, no
+ * frame geometry) in 1536..4608 byte chunks.
  *
- * We expose the compressed stream through an ALSA PCM capture device using
- * SNDRV_PCM_FORMAT_MPEG (the standard compressed-passthrough format, same
- * mechanism as HDMI AC3/DTS/AAC drivers). A kfifo buffers DMA'd frames; the
- * copy_user path drains it. No sample parsing is done (the data is opaque
- * AAC; userspace treats it as a byte stream).
+ * We expose the raw PCM stream through an ALSA PCM capture device as
+ * S16_LE 2ch @48kHz. A kfifo buffers DMA'd frames; the copy_user path drains
+ * it. No sample parsing is done beyond the fixed S16_LE layout (userspace
+ * consumes it as ordinary PCM).
  */
 
 #include <linux/module.h>
@@ -29,7 +29,7 @@
 #include "c985.h"
 
 #define C985_AUDIO_NAME       "c985-audio"
-/* AAC frames are <=4608 bytes; keep a generous software FIFO. */
+/* LPCM frames are <=4608 bytes; keep a generous software FIFO. */
 #define C985_AUDIO_FIFO_BYTES (256 * 1024)
 
 struct c985_audio {
@@ -48,6 +48,8 @@ struct c985_audio {
     dma_addr_t dma_phys;
     size_t dma_size;
 
+    struct c985_frame_op op; /* single in-flight async linear audio DMA op */
+
     atomic64_t frames_done;
     atomic64_t bytes_done;
     atomic64_t frames_dropped;   /* fifo full or no data */
@@ -56,44 +58,23 @@ struct c985_audio {
     unsigned long last_period;   /* last signaled period index */
 };
 
-/* ---- audio_consumer: called from mbox drain work for taskId==1 descs ---- */
+/* ---- audio_consumer + async completion (taskId==1 descs) ---- */
 
-static void c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
+/* DMA completion: run in dma_frame_wq (process context) after the linear
+ * read lands. Copy the bounce buffer into the ALSA ring/fifo, release the
+ * firmware ring slot (0x30), and re-pump the mbox drain work. */
+static void c985_audio_done(struct c985_frame_op *op)
 {
+    struct c985_dev *dev = op->dev;
     struct c985_audio *a = dev->audio_priv;
     struct snd_pcm_substream *substream;
     struct snd_pcm_runtime *runtime;
     unsigned long buf_bytes, period_bytes;
     u8 *dma_area;
     unsigned long off;
-    int n;
+    u32 bytes = op->desc.chroma << 2;
 
-    if (!a || !a->running) {
-        dev_dbg(&dev->pdev->dev, "audio: desc dropped, not running\n");
-        return;
-    }
-
-    /* Class-4 (compressed audio) descriptor: addr = y_dw (DWORDS -> <<2 for
-     * bytes), size = chroma field in DWORDS (firmware reserved3), so -> <<2
-     * for byte length. Verified against the Windows class-4 record build
-     * (addrDWORDS=0x6B8, sizeDWORDS=0x6C0). */
-    u32 bytes = d->chroma << 2;
-
-    if (d->y_dw == 0 || d->chroma == 0 || bytes > a->dma_size) {
-        dev_dbg(&dev->pdev->dev, "audio: bad desc addr=0x%x size_dw=%u\n",
-                d->y_dw, d->chroma);
-        atomic64_inc(&a->frames_dropped);
-        return;
-    }
-
-    /* Linear read (no frame geometry): card buffer addr << 2, size = bytes. */
-    n = c985_dma_read_linear(dev, d->y_dw << 2, a->dma_phys, bytes);
-    if (n < 0) {
-        dev_dbg(&dev->pdev->dev, "audio: DMA read failed: %d\n", n);
-        atomic64_inc(&a->frames_dropped);
-        return;
-    }
-
+    /* Copy bounce -> ALSA ring (or kfifo if no substream yet). */
     substream = READ_ONCE(a->substream);
     if (!substream || !substream->runtime)
         goto fifo;
@@ -122,19 +103,82 @@ static void c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
         snd_pcm_period_elapsed(substream);
     }
 
-    atomic64_inc(&a->frames_done);
-    atomic64_add(bytes, &a->bytes_done);
-    wake_up_all(&a->wq);
-    return;
+    goto accounted;
 
 fifo:
     mutex_lock(&a->lock);
     if (kfifo_in(&a->fifo, a->dma_buf, bytes) < bytes)
         atomic64_inc(&a->frames_dropped);
     mutex_unlock(&a->lock);
-    atomic64_inc(&a->frames_done);
-    atomic64_add(bytes, &a->bytes_done);
+
+accounted:
+    if (!op->failed) {
+        atomic64_inc(&a->frames_done);
+        atomic64_add(bytes, &a->bytes_done);
+    } else {
+        atomic64_inc(&a->frames_dropped);
+    }
     wake_up_all(&a->wq);
+
+    /* Release the card ring slot now that the DMA has actually completed. */
+    c985_mbox_release_desc(dev, &op->desc);
+
+    /* Engine is free: re-pump the drain work so queued descriptors flow. */
+    queue_work(dev->mbox_drain_wq, &dev->mbox_drain_work.work);
+}
+
+/* audio_consumer: called from mbox drain work for taskId==1 descriptors.
+ * Submits the linear DMA read ASYNCHRONOUSLY (Windows sync(0)/DPC model) and
+ * returns immediately. Return: 0 = in flight, -EBUSY = engine busy (deferral),
+ * <0 = dropped (ring slot already released). */
+static int c985_audio_consume(struct c985_dev *dev, struct c985_frame_desc *d)
+{
+    struct c985_audio *a = dev->audio_priv;
+    u32 bytes;
+    int ret;
+
+    if (!a || !a->running) {
+        dev_dbg(&dev->pdev->dev, "audio: desc dropped, not running\n");
+        c985_mbox_release_desc(dev, d);
+        return 0;
+    }
+
+    /* Class-4 (compressed audio) descriptor: addr = y_dw (DWORDS -> <<2 for
+     * bytes), size = chroma field in DWORDS (firmware reserved3), so -> <<2
+     * for byte length. Verified against the Windows class-4 record build
+     * (addrDWORDS=0x6B8, sizeDWORDS=0x6C0). */
+    bytes = d->chroma << 2;
+
+    if (d->y_dw == 0 || d->chroma == 0 || bytes > a->dma_size) {
+        dev_dbg(&dev->pdev->dev, "audio: bad desc addr=0x%x size_dw=%u\n",
+                d->y_dw, d->chroma);
+        atomic64_inc(&a->frames_dropped);
+        c985_mbox_release_desc(dev, d);
+        return -EINVAL;
+    }
+
+    /* Linear read (no frame geometry): card buffer addr << 2, size = bytes. */
+    a->op.dev = dev;
+    a->op.desc = *d;
+    a->op.linear = true;
+    a->op.card_addr = d->y_dw << 2;
+    a->op.len = bytes;
+    a->op.dst_phys = a->dma_phys;
+    a->op.done_cb = c985_audio_done;
+
+    ret = c985_dma_submit_linear(&a->op);
+    if (ret) {
+        dev_dbg(&dev->pdev->dev, "audio: async DMA submit failed: %d\n", ret);
+        if (ret == -EBUSY) {
+            /* Engine busy: defer, do NOT release the ring slot. */
+            return -EBUSY;
+        }
+        atomic64_inc(&a->frames_dropped);
+        c985_mbox_release_desc(dev, d);
+        return -EINVAL;
+    }
+
+    return 0;
 }
 
 /* ---- ALSA PCM capture callbacks ---- */
@@ -155,13 +199,11 @@ static struct snd_pcm_hardware c985_audio_hw = {
 };
 
 /*
- * AAC-LC passthrough: the firmware emits compressed AAC, but ALSA cannot
- * negotiate a zero-width compressed format (MPEG is filtered out in
- * snd_pcm_hw_rule_format). We therefore expose S16_LE as an opaque BYTE
- * transport: the interleaved 2ch framing is ignored by userspace, which
- * decodes the raw AAC bitstream itself (ffmpeg -f alsa -> -f adts). The
- * kfifo carries raw AAC bytes; period/buffer math is still well-defined
- * because S16_LE has a real 16-bit width.
+ * Raw LPCM capture: the firmware emits uncompressed S16_LE interleaved
+ * stereo PCM (audio_type=0 LPCM-ex bypass). We expose S16_LE 2ch @48kHz
+ * directly; the interleaved framing is treated as ordinary PCM by
+ * userspace (ffmpeg/arecord -f S16_LE). The kfifo carries raw PCM bytes;
+ * period/buffer math uses the real 16-bit S16_LE width.
  */
 static int c985_audio_pcm_open(struct snd_pcm_substream *substream)
 {
@@ -362,7 +404,7 @@ int c985_audio_init(struct c985_dev *dev)
 
     strscpy(card->driver, "c985", sizeof(card->driver));
     strscpy(card->shortname, C985_AUDIO_NAME, sizeof(card->shortname));
-    strscpy(card->longname, "AVerMedia C985 AAC Capture",
+    strscpy(card->longname, "AVerMedia C985 LPCM Capture",
             sizeof(card->longname));
 
     ret = snd_pcm_new(card, C985_AUDIO_NAME, 0, 0, 1, &a->pcm);
@@ -413,6 +455,12 @@ void c985_audio_cleanup(struct c985_dev *dev)
     dev->audio_consumer = NULL;
     a->running = false;
     wake_up_all(&a->wq);
+
+    /* An in-flight async linear DMA op holds dev->dma_cur_op pointing at
+     * a->op; flush the frame workqueue so the done_cb runs (and clears the
+     * slot) before we free the bounce buffer and the op's backing memory. */
+    if (dev->dma_frame_wq)
+        flush_workqueue(dev->dma_frame_wq);
 
     if (a->card)
         snd_card_free(a->card);

@@ -659,6 +659,20 @@ static int c985_debugfs_counters_show(struct seq_file *m, void *v)
     seq_printf(m, "\n=== frame fifo ===\n");
     seq_printf(m, "pushed: %d\n", atomic_read(&dev->frame_fifo.frames));
     seq_printf(m, "overflow: %d\n", atomic_read(&dev->frame_fifo.overflow));
+
+    seq_printf(m, "\n=== dma stall ===\n");
+    seq_printf(m, "dma_stalls:       %d\n", atomic_read(&dev->dma_stalls));
+    seq_printf(m, "dma_ebusy_submits:%d\n", atomic_read(&dev->dma_ebusy_submits));
+    {
+        u32 st = c985_read_bar0(dev, C985_DMA_CHAN_BASE +
+                                dev->dma_read_chan * C985_DMA_CHAN_STRIDE +
+                                C985_DMA_REG_CTRL);
+        seq_printf(m, "read_engine_ctrl: 0x%08x (busy=%d done=%d)\n",
+                   st, !!(st & C985_DMA_STATUS_BUSY),
+                   !!(st & C985_DMA_STATUS_DONE));
+        seq_printf(m, "dma_cur_op:       %s\n",
+                   READ_ONCE(dev->dma_cur_op) ? "latched" : "idle");
+    }
     return 0;
 }
 

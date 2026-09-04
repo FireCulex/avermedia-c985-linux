@@ -2,7 +2,7 @@
 
 Linux V4L2 driver for the AVerMedia C985 (1af2:a001), implementing support for the card's vendor-specific mailbox-based firmware protocol, reverse-engineered from the Windows driver and ARM firmware.
 
-**Video capture: working** | **Audio capture: working (AAC-LC passthrough via ALSA PCM)**
+**Video capture: working** | **Audio capture: working (raw LPCM via ALSA PCM)**
 
 ![OBS Capture](https://i.imgur.com/TRJMRWp.png)
 
@@ -10,7 +10,7 @@ Linux V4L2 driver for the AVerMedia C985 (1af2:a001), implementing support for t
 
 - AVerMedia C985 (Live Gamer HD 2) PCIe capture card
 - PCI Vendor ID: `0x1AF2`, Device ID: `0xA001`
-- Onboard Nuvoton NUC100 microcontroller for sensor config
+- Onboard Nuvoton NUC100RD2BN microcontroller
 - TI TLV320AIC3101 audio codec
 
 ## Requirements
@@ -91,21 +91,21 @@ Override PCI ID: `C985_PCI_ID=0000:01:00.0 sudo ./tools/c985-bind.sh bind`
 
 ## Audio Capture
 
-The driver registers an ALSA capture device (`c985-audio`) delivering raw AAC-LC frames (48 kHz, stereo, ~128 kbps). The format is exposed as `S16_LE` (opaque byte transport); userspace decodes the bitstream.
+The driver registers an ALSA capture device (`c985-audio`) delivering raw LPCM S16_LE interleaved stereo (48 kHz). Userspace consumes it as ordinary PCM.
 
 ```bash
 # List audio devices
 arecord -l
 
-# Capture raw AAC to file (card index varies, check arecord -l)
-arecord -D hw:C985 -f S16_LE -c 2 -r 48000 -t raw audio.aac
+# Capture raw PCM to file (card index varies, check arecord -l)
+arecord -D hw:C985 -f S16_LE -c 2 -r 48000 -t raw audio.raw
 
-# Play back with ffmpeg (decode AAC on the fly)
-ffmpeg -f alsa -i hw:C985 -f adts - | ffplay -f adts -
+# Play back with ffmpeg (decode PCM on the fly)
+ffmpeg -f alsa -i hw:C985 -f s16le - | ffplay -f s16le -
 
-# Or save as ADTS and play
-ffmpeg -f alsa -i hw:C985 -c copy audio.adts
-ffplay audio.adts
+# Or save as WAV and play
+ffmpeg -f alsa -i hw:C985 -c copy audio.wav
+ffplay audio.wav
 ```
 
 **Note:** The ALSA device appears after `c985_audio_boot()` runs (triggered by opening the video device for streaming). Open `/dev/video0` first (e.g., `v4l2-ctl --stream-mmap=3 --stream-to=/dev/null`), then the audio device will be active.
@@ -145,7 +145,7 @@ When loaded, the driver exposes debugfs at `/sys/kernel/debug/c985/`:
 | `regs` | BAR0/BAR1 register dump |
 | `mbox_log` | Mailbox command/response log |
 | `frame_read` | Capture a frame to userspace (debug) |
-| `cpr_peek` | Read CPR (NUC100) registers |
+| `cpr_peek` | Read CPR (Card Program Register) registers |
 | `dma_status` | DMA channel state |
 
 ## Architecture
@@ -164,22 +164,32 @@ PCIe → BAR0 (DMA) / BAR1 (Mailbox/ARM) → Firmware (QPSOS) → v4l2 → /dev/
 | `c985_mbox.c` | Mailbox command/response + interrupt-driven frame FIFO |
 | `c985_irq.c` | MSI/MSI-X, PCIe/HCI/doorbell interrupt handling |
 | `c985_fw.c` | QPSOS firmware load (video + audio) |
-| `c985_audio.c` | ALSA PCM capture (AAC-LC passthrough) |
-| `c985_nuc100.c` | CPR register access for NUC100 sensor config |
+| `c985_audio.c` | ALSA PCM capture (raw LPCM) |
+| `c985_nuc100.c` | NUC100 MCU register access |
 | `c985_debugfs.c` | Debugfs knobs |
 | `cpr.c` | CPR register helpers |
 
 **References:**
-- [Nuvoton NUC100 Series Manual](https://www.nuvoton-tech.com/pdf-71/nuc100rd1bn.pdf)
-- [TI TLV320AIC3101 Datasheet](https://www.ti.com/product/TLV320AIC3101)
+- [Nuvoton NUC100RD2BN](https://www.keil.com/dd/chip/7119.htm)
+- [TI TLV320AIC3101 Datasheet](https://www.ti.com/lit/ds/symlink/tlv320aic3101.pdf)
 
 ## Known Limitations
 
 - No support for other AVerMedia models
 - Requires Clang/LLVM for build
-- Audio capture exposes raw AAC frames; userspace must decode (e.g., ffmpeg `-f alsa -i hw:X -f adts - | ffplay -f adts -`)
+- Audio capture exposes raw LPCM; userspace consumes it as ordinary PCM (e.g., ffmpeg `-f alsa -i hw:X -f s16le -`)
 
 Video capture uses `vb2_dma_sg` (scatter-gather) with a 64-bit DMA mask. Each Y/U/V plane read walks the `sg_table` emitting one chained descriptor per SG element (`c985_dma_read_frame_mode_sg`). Buffer count is a hard 4 (firmware 4-slot ring).
+
+### Frame-Capture Quality Baseline
+
+Perfect frame capture is unlikely on this card, even in Windows — confirmed both by `test_sync.py` and by visual inspection in Avidemux, where the on-screen leader counter visibly skips `29→02` (missing `00/01`).
+
+- Windows 2-minute baseline (`windows_2min_sync_test.mp4`): 16 duplicate frames + 3 dropped, clustering roughly every 15.5s.
+- Linux driver (30s captures): ~1–3 duplicates, 0 drops, on the same ~15.5s cadence.
+- Observed error rate: 0–0.5% of frames (duplicates + skips) per 2-minute capture, on both platforms.
+
+Do not treat "zero dup / zero drop" as a driver correctness target. Both platforms show the same underlying firmware/encoder ~15.5s cadence (likely GOP/IDR boundary or ring-buffer recycle).
 
 ## Common Gotchas
 

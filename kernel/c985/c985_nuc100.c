@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* c985_nuc100.c - NUC100 MCU access via GPIO bit-bang I2C (pins 14=SCL 15=SDA)
+/* c985_nuc100.c - NUC100RD2BN MCU access via GPIO bit-bang I2C (pins 14=SCL 15=SDA)
  *
  * Transport ground truth: host GPIO bit-bang is the only silicon-proven path
  * to the NUC100 (vault dmesg: "NUC100: ID 0x393835, FW v0x16"). Firmware's own

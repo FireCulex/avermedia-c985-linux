@@ -1,7 +1,7 @@
 # AVerMedia C985 Linux Driver — Agent Instructions
 
 ## Repository Overview
-Kernel driver for AVerMedia C985 PCIe capture card (1af2:a001). Implements v4l2 video capture + ALSA audio capture via custom DMA/mailbox firmware protocol. **Video capture: working. Audio capture: working (AAC-LC passthrough via ALSA PCM).**
+Kernel driver for AVerMedia C985 PCIe capture card (1af2:a001). Implements v4l2 video capture + ALSA audio capture via custom DMA/mailbox firmware protocol. **Video capture: working. Audio capture: working (raw LPCM via ALSA PCM).**
 
 ## Build & Test Commands
 ```bash
@@ -33,8 +33,8 @@ C985_DEVICE=/dev/video2 ./run_tests.sh      # Override device path
   - `c985_mbox.c` — Mailbox command/response + interrupt-driven frame FIFO
   - `c985_irq.c` — MSI/MSI-X, PCIe/HCI/doorbell interrupt handling
   - `c985_fw.c` — QPSOS firmware load (video + audio)
-  - `c985_audio.c` — ALSA PCM capture (AAC-LC passthrough, SNDRV_PCM_FORMAT_MPEG via S16_LE opaque transport)
-  - `c985_nuc100.c` — CPR register access for NUC100 sensor config
+  - `c985_audio.c` — ALSA PCM capture (raw LPCM S16_LE stereo @48kHz)
+  - `c985_nuc100.c` — NUC100 MCU register access via GPIO bit-bang I2C
   - `c985_debugfs.c` — Debugfs knobs (frame_read, CPR peek, diags)
   - `cpr.c` — CPR register helpers
 - **Bind script**: `tools/c985-bind.sh` — handles PCI ID binding, module reload on srcversion mismatch, kills stale `/dev/video*` and ALSA holders
@@ -59,11 +59,17 @@ C985_DEVICE=/dev/video2 ./run_tests.sh      # Override device path
     - Verify writability first: `echo -n > /sys/kernel/debug/dynamic_debug/control`
   - Module built with `ccflags-y += -DDEBUG` always emits `dev_dbg` without dynamic_debug; prefer runtime `+p` to avoid rebuild.
 
+## Frame-Capture Quality Baseline (IMPORTANT)
+- **Perfect frame capture is unlikely on this card, even in Windows** — confirmed both by `test_sync.py` and by visual inspection in Avidemux, where the on-screen leader counter visibly skips `29→02` (missing `00/01`).
+- Windows 2-minute baseline (`windows_2min_sync_test.mp4`): 16 duplicate frames + 3 dropped, clustering roughly every 15.5s. Linux driver (30s captures): ~1–3 duplicates, 0 drops, on the same ~15.5s cadence.
+- Observed error rate: 0–0.5% of frames (duplicates + skips) per 2-minute capture, on both platforms.
+- Do NOT treat "zero dup / zero drop" as a driver correctness target. Both platforms show the same underlying firmware/encoder ~15.5s cadence (likely GOP/IDR boundary or ring-buffer recycle).
+
 ## Common Gotchas
 - `rmmod c985` fails "Module in use" if any process holds `/dev/video*` or ALSA devices — bind script kills holders
 - Stale module (rebuild without reload) detected via `srcversion` mismatch — bind script force-reloads
 - Tests require bound module + running firmware; `run_tests.sh` handles full bind/test cycle
 - No CI/CD, no static analysis, no formatting tools configured
 - If bind script reports "c985 is loaded with refcnt=X (in use / deadlocked); reboot required" — reboot is the only fix
-- Audio capture implemented as ALSA PCM (AAC-LC passthrough); userspace must decode raw AAC frames
+- Audio capture implemented as ALSA PCM (raw LPCM S16_LE stereo @48kHz); userspace consumes it as ordinary PCM
 - Video capture uses `vb2_dma_sg` (scatter-gather) with a 64-bit DMA mask. Each Y/U/V plane read walks the `sg_table` emitting one chained descriptor per SG element (`c985_dma_read_frame_mode_sg`). Buffer count is a hard 4 (firmware 4-slot ring).
