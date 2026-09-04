@@ -2,18 +2,18 @@
 /*
  * c985_audio.c - ALSA audio capture for the AVerMedia C985.
  *
- * The card's native record format is MPEG4 (H.264 + AAC): the audio task
- * (taskId 1, function 0x80000040) emits AAC-LC frames (@48kHz/128kbps/
- * stereo in the reference OBS session). Those frames are delivered on the
- * same 0x40/0x41 EncDataOutReq mailbox descriptor as video, tagged with
- * taskId=1 in the upper 16 bits of 0x6B0, and are DMA-read LINEARLY
- * (ctrl 0x0804200F, no frame geometry) in 1536..4608 byte chunks.
+ * The audio task (taskId 1, function 0x80000040) emits raw LPCM S16_LE
+ * interleaved stereo (48kHz) — audio_type=0 in EncAudioControlParam (0x6D4)
+ * is LPCM-ex bypass, with EncAudioControlExLPCM=0x480 (1152-sample
+ * frames = 4608 bytes). Frames are delivered on the same 0x40/0x41
+ * EncDataOutReq mailbox descriptor as video, tagged with taskId=1 in the
+ * upper 16 bits of 0x6B0, and are DMA-read LINEARLY (ctrl 0x0804200F, no
+ * frame geometry) in 1536..4608 byte chunks.
  *
- * We expose the compressed stream through an ALSA PCM capture device using
- * SNDRV_PCM_FORMAT_MPEG (the standard compressed-passthrough format, same
- * mechanism as HDMI AC3/DTS/AAC drivers). A kfifo buffers DMA'd frames; the
- * copy_user path drains it. No sample parsing is done (the data is opaque
- * AAC; userspace treats it as a byte stream).
+ * We expose the raw PCM stream through an ALSA PCM capture device as
+ * S16_LE 2ch @48kHz. A kfifo buffers DMA'd frames; the copy_user path drains
+ * it. No sample parsing is done beyond the fixed S16_LE layout (userspace
+ * consumes it as ordinary PCM).
  */
 
 #include <linux/module.h>
@@ -29,7 +29,7 @@
 #include "c985.h"
 
 #define C985_AUDIO_NAME       "c985-audio"
-/* AAC frames are <=4608 bytes; keep a generous software FIFO. */
+/* LPCM frames are <=4608 bytes; keep a generous software FIFO. */
 #define C985_AUDIO_FIFO_BYTES (256 * 1024)
 
 struct c985_audio {
@@ -199,13 +199,11 @@ static struct snd_pcm_hardware c985_audio_hw = {
 };
 
 /*
- * AAC-LC passthrough: the firmware emits compressed AAC, but ALSA cannot
- * negotiate a zero-width compressed format (MPEG is filtered out in
- * snd_pcm_hw_rule_format). We therefore expose S16_LE as an opaque BYTE
- * transport: the interleaved 2ch framing is ignored by userspace, which
- * decodes the raw AAC bitstream itself (ffmpeg -f alsa -> -f adts). The
- * kfifo carries raw AAC bytes; period/buffer math is still well-defined
- * because S16_LE has a real 16-bit width.
+ * Raw LPCM capture: the firmware emits uncompressed S16_LE interleaved
+ * stereo PCM (audio_type=0 LPCM-ex bypass). We expose S16_LE 2ch @48kHz
+ * directly; the interleaved framing is treated as ordinary PCM by
+ * userspace (ffmpeg/arecord -f S16_LE). The kfifo carries raw PCM bytes;
+ * period/buffer math uses the real 16-bit S16_LE width.
  */
 static int c985_audio_pcm_open(struct snd_pcm_substream *substream)
 {
@@ -406,7 +404,7 @@ int c985_audio_init(struct c985_dev *dev)
 
     strscpy(card->driver, "c985", sizeof(card->driver));
     strscpy(card->shortname, C985_AUDIO_NAME, sizeof(card->shortname));
-    strscpy(card->longname, "AVerMedia C985 AAC Capture",
+    strscpy(card->longname, "AVerMedia C985 LPCM Capture",
             sizeof(card->longname));
 
     ret = snd_pcm_new(card, C985_AUDIO_NAME, 0, 0, 1, &a->pcm);

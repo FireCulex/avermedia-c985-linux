@@ -105,15 +105,15 @@
 #define C985_ENC_CFG_REGS       11
 
 /*
- * Audio capture via the compressed path (live OBS ground truth): the card
- * records AAC-LC @48kHz/128kbps/stereo natively (product spec MPEG4
- * H.264+AAC). Audio frames arrive on the SAME 0x40/0x41 EncDataOutReq
- * descriptor as video, tagged taskId=1 in the upper 16 bits of 0x6B0, and
- * are DMA-read LINEARLY (ctrl 0x0804200F, w=0 h=0) in 1536/3072/4608-byte
- * chunks. Raw PCM (RawAudOutput 0x82, ARM_BUF_OTHERS) uses the separate
- * 0xC0 descriptor with 0xA0/0xA1 reply instead.
+ * Audio capture via the raw PCM path (live OBS ground truth): the audio
+ * task emits LPCM S16_LE stereo @48kHz (audio_type=0 LPCM-ex bypass,
+ * EncAudioControlExLPCM=0x480). Audio frames arrive on the SAME 0x40/0x41
+ * EncDataOutReq descriptor as video, tagged taskId=1 in the upper 16 bits of
+ * 0x6B0, and are DMA-read LINEARLY (ctrl 0x0804200F, w=0 h=0) in
+ * 1536/3072/4608-byte chunks. Raw PCM (RawAudOutput 0x82, ARM_BUF_OTHERS)
+ * uses the separate 0xC0 descriptor with 0xA0/0xA1 reply instead.
  */
-#define C985_AUDIO_FRAME_MAX    8192    /* generous: AAC frames are <=4608 */
+#define C985_AUDIO_FRAME_MAX    8192    /* generous: LPCM frames are <=4608 */
 
 /* Frame readback cap (debugfs frame_read) */
 #define C985_FRAME_MAX          (8u * 1024u * 1024u)
@@ -317,7 +317,7 @@ struct c985_dev {
 
     /* Audio consumer hook: called from mbox drain work with each popped
      * 0x40/0x41 descriptor whose taskId==C985_AUD_TASK. The audio layer
-     * asynchronously DMA-reads the (compressed AAC) buffer linearly and feeds
+     * asynchronously DMA-reads the (raw LPCM) buffer linearly and feeds
      * ALSA. Return 0 = submitted (in flight), -EBUSY = engine busy (deferral:
      * caller must push the descriptor back to the FIFO front), <0 = dropped
      * (ring slot already released by the layer). Descriptor fields reused:
