@@ -383,6 +383,12 @@ static int c985_querycap(struct file *file, void *fh,
     strscpy(cap->driver, "c985", sizeof(cap->driver));
     strscpy(cap->card, "AverMedia C985", sizeof(cap->card));
     strscpy(cap->bus_info, "PCIe", sizeof(cap->bus_info));
+    /* NOTE: deliberately NOT advertising V4L2_CAP_TIMEPERFRAME. On this
+     * kernel's videodev2.h that bit (0x1000) collides with
+     * V4L2_CAP_VIDEO_CAPTURE_MPLANE (also 0x1000), so setting it would
+     * falsely tell userspace we accept VIDIOC_S_FMT with a
+     * v4l2_pix_format_mplane, which we do not implement. The ioctls work
+     * regardless - only the advertised cap bit is affected. */
     cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
                        V4L2_CAP_READWRITE;
     cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
@@ -418,8 +424,8 @@ static int c985_g_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
     if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
         return -EINVAL;
     a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-    a->parm.capture.timeperframe.numerator = 1;
-    a->parm.capture.timeperframe.denominator = 30;
+    a->parm.capture.timeperframe.numerator = C985_FPS_NUM;
+    a->parm.capture.timeperframe.denominator = C985_FPS_DEN;
     return 0;
 }
 
@@ -427,6 +433,52 @@ static int c985_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
 {
     if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
         return -EINVAL;
+
+    /* The engine is fixed-rate, so there is nothing to negotiate - but the
+     * v4l2 spec still requires S_PARM to write back the ACCEPTED parameters,
+     * and userspace depends on that echo. OBS' linux-v4l2 plugin
+     * (v4l2-helpers.c v4l2_set_framerate) re-reads a->parm after this call
+     * and derives its capture-thread select() timeout from it. It unpacks
+     * the tuple it was configured with, and older saved settings are
+     * 16-bit packed, which yields a ZERO numerator. With that propagated
+     * back out, OBS computes fps = denominator/0 = inf and then
+     * timeout = 5*1e6/inf = 0, i.e. a zero-length select() on the capture
+     * node: a pure busy-poll that also spams two log lines per iteration
+     * (observed 463k-6M iterations, 52 MB - 3.0 GB of log, and a full
+     * filesystem). Echoing a sanitized 1/30 bounds the caller to a real
+     * frame period no matter what it asked for. */
+    a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+    a->parm.capture.timeperframe.numerator = C985_FPS_NUM;
+    a->parm.capture.timeperframe.denominator = C985_FPS_DEN;
+    return 0;
+}
+
+static int c985_enum_framesizes(struct file *file, void *fh,
+                                struct v4l2_frmsizeenum *f)
+{
+    /* One geometry only. index != 0 (or a foreign pixel format) must fail so
+     * userspace enumeration loops terminate instead of looping forever. */
+    if (f->index != 0 || f->pixel_format != V4L2_PIX_FMT_YUV420)
+        return -EINVAL;
+
+    f->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+    f->discrete.width = C985_WIDTH;
+    f->discrete.height = C985_HEIGHT;
+    return 0;
+}
+
+static int c985_enum_frameintervals(struct file *file, void *fh,
+                                    struct v4l2_frmivalenum *f)
+{
+    /* One frame period only, for the single supported format/geometry. */
+    if (f->index != 0 || f->pixel_format != V4L2_PIX_FMT_YUV420)
+        return -EINVAL;
+    if (f->width != C985_WIDTH || f->height != C985_HEIGHT)
+        return -EINVAL;
+
+    f->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+    f->discrete.numerator = C985_FPS_NUM;
+    f->discrete.denominator = C985_FPS_DEN;
     return 0;
 }
 
@@ -488,6 +540,8 @@ static const struct v4l2_ioctl_ops c985_ioctl_ops = {
     .vidioc_s_input = c985_s_input,
     .vidioc_g_parm = c985_g_parm,
     .vidioc_s_parm = c985_s_parm,
+    .vidioc_enum_framesizes = c985_enum_framesizes,
+    .vidioc_enum_frameintervals = c985_enum_frameintervals,
     .vidioc_enum_fmt_vid_cap = c985_enum_fmt_vid_cap,
     .vidioc_g_fmt_vid_cap = c985_g_fmt,
     .vidioc_try_fmt_vid_cap = c985_try_fmt,
@@ -664,6 +718,8 @@ int c985_v4l2_init(struct c985_dev *dev)
     c->vdev.v4l2_dev = &c->v4l2_dev;
     c->vdev.vfl_dir = VFL_DIR_RX;   /* capture (RX) */
     c->vdev.release = video_device_release_empty;
+    /* See the V4L2_CAP_TIMEPERFRAME / _MPLANE bit collision noted in
+     * c985_querycap(). */
     c->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
                           V4L2_CAP_READWRITE;
     strscpy(c->vdev.name, C985_V4L2_NAME, sizeof(c->vdev.name));

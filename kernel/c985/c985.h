@@ -222,6 +222,12 @@ struct c985_frame_op {
 #define C985_C_LEN               (C985_Y_LEN / 4)
 #define C985_FRAME_BYTES         (C985_Y_LEN + 2 * C985_C_LEN)
 
+/* The capture engine is a fixed 1080p30 source: format, geometry and rate are
+ * all non-negotiable, so VIDIOC_G_PARM / S_PARM / ENUM_FRAMEINTERVALS report
+ * this single frame period. Single source of truth - do not hand-code 30. */
+#define C985_FPS_NUM             1
+#define C985_FPS_DEN             30
+
 /* Mailbox FIFO for 0x40 frame descriptors (ISR push -> workqueue pop). */
 #define C985_FRAME_FIFO_DEPTH    16
 
