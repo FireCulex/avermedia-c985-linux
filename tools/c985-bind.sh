@@ -1,6 +1,15 @@
 #!/bin/sh
 set -eu
 
+# Almost every step here (insmod, sysfs writes, rmmod) needs root. Without it
+# insmod fails with EPERM, and the error used to be swallowed by
+# "2>/dev/null || true", which surfaced as the misleading
+# "driver directory not found after module load". Fail loudly and up front.
+if [ "$(id -u)" != "0" ]; then
+    echo "error: must run as root; try: sudo $0 $*" >&2
+    exit 1
+fi
+
 VENDOR="0x1AF2"
 DEVICE="0xA001"
 DRV=/sys/bus/pci/drivers/c985
@@ -34,6 +43,29 @@ swrite() {
     local file="$1"
     local content="$2"
     echo "$content" > "$file" 2>/dev/null || true
+}
+
+# Helper: rmmod with the real error surfaced, under a hard timeout.
+# A holder wedged in D state cannot be reaped, so never let rmmod block here.
+unload_module() {
+    lsmod | grep -q "^c985 " || return 0
+    if out=$(timeout 10 rmmod c985 2>&1); then
+        return 0
+    fi
+    echo "${1:-unload}: rmmod c985 failed: ${out:-<no output>}" >&2
+    return 1
+}
+
+# Helper: insmod with the real error surfaced. A swallowed EPERM /
+# "Unknown symbol" / "Invalid module format" used to look like a missing
+# driver directory instead of a module that never loaded.
+load_module() {
+    if out=$(insmod "$OUR_KO" $DEBUG 2>&1) && lsmod | grep -q "^c985 "; then
+        return 0
+    fi
+    echo "bind: insmod $OUR_KO ${DEBUG:-}failed: ${out:-<no output>}" >&2
+    echo "bind: check 'sudo dmesg -T | tail' for the kernel-side reason" >&2
+    return 1
 }
 
 # Run systemctl --user as the actual user (not root)
@@ -110,21 +142,26 @@ case "${1:-}" in
   bind)
     # The c985 module IS a v4l2 capture device now; no loopback needed.
 
-    # Refuse to proceed if a live module is wedged (nonzero refcount from
-    # D-state holders that a pkill can't reap). rmmod would hang forever.
-    if lsmod | grep -q "^c985 "; then
-        live_refcnt=$(cat /sys/module/c985/refcnt 2>/dev/null || echo 0)
-        if [ "$live_refcnt" != "0" ]; then
-            echo "bind: c985 is loaded with refcnt=$live_refcnt (in use / deadlocked); reboot required." >&2
-            exit 1
-        fi
-    fi
+    # NOTE on /sys/module/c985/refcnt: a *healthy* probed c985 always reads 1,
+    # not 0. snd_card_new(..., THIS_MODULE) takes a module reference for the
+    # "c985audio" card, and because probe() runs inside init_module that
+    # reference lands in the module's init_refcnt, which the kernel's
+    # try_release_all_refs() deliberately does not treat as a blocker. So
+    # refcnt != 0 is the normal steady state, NOT evidence of a wedged holder.
+    # Treating it as one made every rebind of a working driver fail with a
+    # bogus "reboot required" and made the srcversion-reload path below
+    # unreachable. Real proof of a problem is rmmod itself failing.
 
     # Load videobuf2/v4l2 dependencies (in-kernel driver is a v4l2 capture
     # device now; insmod cannot resolve these symbol deps by itself)
     for m in videobuf2-common videobuf2-memops videobuf2-dma-sg videobuf2-v4l2; do
         if ! lsmod | grep -q "^$m "; then
-            modprobe "$m" 2>/dev/null || true
+            if ! modprobe "$m" 2>/tmp/c985-modprobe-$$.err; then
+                echo "bind: modprobe $m failed: $(cat /tmp/c985-modprobe-$$.err)" >&2
+                rm -f /tmp/c985-modprobe-$$.err
+                exit 1
+            fi
+            rm -f /tmp/c985-modprobe-$$.err
         fi
     done
 
@@ -132,7 +169,9 @@ case "${1:-}" in
     if lsmod | grep -q "^c985 "; then
         if [ ! -L "$DRV/$PCI_ID" ]; then
             echo "bind: c985 loaded but $PCI_ID not bound; unloading stale module" >&2
-            rmmod c985 2>/dev/null || true
+            kill_video_holders
+            kill_alsa_holders
+            unload_module "bind" || true
             sleep 0.2
             rmmod -f c985 2>/dev/null || true
         fi
@@ -143,16 +182,18 @@ case "${1:-}" in
     # so a separate $DRV/bind write would trigger a SECOND probe attempt. We
     # must load exactly once and check the result, never double-bind.
     if ! lsmod | grep -q "^c985 "; then
-        insmod "$OUR_KO" $DEBUG 2>/dev/null || true
+        load_module || exit 1
     else
         disk_sv=$(modinfo "$OUR_KO" -F srcversion 2>/dev/null)
         live_sv=$(cat /sys/module/c985/srcversion 2>/dev/null)
         if [ -n "$disk_sv" ] && [ -n "$live_sv" ] && [ "$disk_sv" != "$live_sv" ]; then
-            echo "bind: loaded c985 (src $live_sv) differs from $OUR_KO (src $disk_sv); removing" >&2
-            rmmod c985 2>/dev/null || true
+            echo "bind: loaded c985 (src $live_sv) differs from $OUR_KO (src $disk_sv); reloading" >&2
+            kill_video_holders
+            kill_alsa_holders
+            unload_module "bind" || true
             sleep 0.2
             rmmod -f c985 2>/dev/null || true
-            insmod "$OUR_KO" $DEBUG 2>/dev/null || true
+            load_module || exit 1
         fi
     fi
 
@@ -163,7 +204,12 @@ case "${1:-}" in
     done
 
     if [ ! -d "$DRV" ]; then
-        echo "driver directory not found after module load" >&2
+        if lsmod | grep -q "^c985 "; then
+            # Module is in, so the .ko loaded fine; the failure is in probe().
+            echo "bind: c985 loaded but probe() did not register a PCI driver ($DRV absent); see dmesg" >&2
+        else
+            echo "bind: c985 is not loaded; $OUR_KO failed to insert" >&2
+        fi
         exit 1
     fi
 
@@ -183,7 +229,7 @@ case "${1:-}" in
         fi
     else
         echo "failed to bind: driver has no bind interface (probe failed)" >&2
-        rmmod c985 2>/dev/null || true
+        unload_module "bind" || true
         exit 1
     fi
     ;;
@@ -191,19 +237,20 @@ case "${1:-}" in
     kill_video_holders
     kill_alsa_holders
 
-    if [ "$(cat /sys/module/c985/refcnt 2>/dev/null || echo 0)" != "0" ]; then
-        echo "unbind: c985 has nonzero refcount (live users present); refusing to force-unload. Kill holders / reboot." >&2
-        exit 1
-    fi
-
     if [ -L "$DRV/$PCI_ID" ]; then
         swrite "$DRV/unbind" "$PCI_ID"
     fi
-    # Retry rmmod briefly; refcount drops after unbind + stragglers die.
+    # Retry rmmod briefly; holders die asynchronously. refcnt is NOT the
+    # success criterion here: probe() leaves a benign init_refcnt=1 behind for
+    # the ALSA card, so check `lsmod`, not /sys/module/c985/refcnt.
     for i in 1 2 3 4 5; do
-        rmmod c985 2>/dev/null && break
+        lsmod | grep -q "^c985 " || break
+        unload_module "unbind" >/dev/null 2>&1 || true
         sleep 0.2
     done
+    if lsmod | grep -q "^c985 "; then
+        unload_module "unbind" || true
+    fi
     rmmod v4l2loopback 2>/dev/null || true
 
     # Restart user PipeWire/WirePlumber stack so audio works again.
