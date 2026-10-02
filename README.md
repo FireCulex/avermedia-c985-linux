@@ -2,9 +2,48 @@
 
 Linux V4L2 driver for the AVerMedia C985 (1af2:a001), implementing support for the card's vendor-specific mailbox-based firmware protocol, reverse-engineered from the Windows driver and ARM firmware.
 
-**Video capture: working** | **Audio capture: working (raw LPCM via ALSA PCM)**
-
 ![OBS Capture](https://i.imgur.com/TRJMRWp.png)
+
+## Project Status
+
+| Feature | State |
+|---------|-------|
+| Video capture | **Working** — 1920×1080 YUV420 (YU12) @ 30 fps via V4L2/vb2 |
+| Audio capture | **Working** — raw LPCM S16_LE interleaved stereo @ 48 kHz via ALSA PCM |
+| Other AVerMedia models | **Not supported** |
+
+Honest notes before you start:
+
+- This is an **unofficial, reverse-engineered** driver. The firmware protocol was
+  recovered from the Windows driver and the ARM firmware blobs; there is no vendor
+  documentation or support.
+- Audio only becomes available **after the video device is opened for streaming**
+  (see [Audio Capture](#audio-capture)).
+- Frame capture is **not bit-perfect** — expect the occasional duplicate or dropped
+  frame. This is a property of the card's firmware/encoder and appears on Windows
+  too; see [Frame-Capture Quality Baseline](#frame-capture-quality-baseline).
+- `make` must use the **same compiler family** as your kernel (gcc or clang). This
+  is detected automatically; see [Building](#building).
+
+## Contents
+
+- [Project Status](#project-status)
+- [Hardware](#hardware)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Firmware Installation](#firmware-installation)
+- [Building](#building)
+- [Binding / Unbinding](#binding--unbinding)
+- [Audio Capture](#audio-capture)
+- [Running Tests](#running-tests)
+- [Debugfs Interface](#debugfs-interface)
+- [Architecture](#architecture)
+- [Known Limitations](#known-limitations)
+  - [Frame-Capture Quality Baseline](#frame-capture-quality-baseline)
+- [Common Gotchas](#common-gotchas)
+- [Development](#development)
+- [License](#license)
+- [Contributing](#contributing)
 
 ## Hardware
 
