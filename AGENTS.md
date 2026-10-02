@@ -5,12 +5,19 @@ Kernel driver for AVerMedia C985 PCIe capture card (1af2:a001). Implements v4l2 
 
 ## Build & Test Commands
 ```bash
-# Build kernel module (requires kernel headers, LLVM/Clang)
-cd kernel/c985 && LLVM=1 make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
-# or: cd kernel/c985 && make        # (uses Makefile's LLVM=1 default)
+# Build kernel module (requires kernel headers)
+cd kernel/c985 && make                    # auto-selects the target kernel's compiler
+
+# Build against a specific installed kernel
+cd kernel/c985 && make KVER=7.2.7-1-cachyos
+
+# Verbose build / override compiler detection
+cd kernel/c985 && make KBUILD_FLAGS='W=1'
+cd kernel/c985 && make CC_FAMILY=clang         # force clang
+cd kernel/c985 && make help                    # list targets and variables
 
 # Clean
-cd kernel/c985 && LLVM=1 make -C /lib/modules/$(uname -r)/build M=$(pwd) clean
+cd kernel/c985 && make clean
 
 # Run tests (requires physical device + sudo)
 ./run_tests.sh                              # Full suite: binds module, captures 30 frames
@@ -41,7 +48,7 @@ C985_DEVICE=/dev/video2 ./run_tests.sh      # Override device path
 - **Test**: `tests/test_capture.py` — Uses `v4l2-ctl --stream-mmap --stream-show-delta-now` to verify 30fps timing, monotonic sequences, YUV420 1920x1080, frame uniqueness
 
 ## Key Conventions
-- Kernel build uses `LLVM=1` (Clang) — required; GCC builds not supported
+- Kernel build is **compiler-agnostic**: `kernel/c985/Makefile` auto-detects the target kernel's compiler family and passes `LLVM=1` only when needed (`KVER` defaults to `uname -r`, so a plain `make` always matches the running kernel). Both gcc and clang kernels work with no extra flags. NEVER hardcode `LLVM=1` — an out-of-tree module must use the same compiler family as the target kernel, because kbuild bakes the kernel's toolchain into `KBUILD_CFLAGS`. **Critically, the kernel build tree does NOT auto-select the compiler**: its Makefile keys `CC=clang` on `$(LLVM)` being non-empty and otherwise uses `$(CROSS_COMPILE)gcc`, even when `CONFIG_CC_IS_CLANG=y` is in `auto.conf`. So a clang kernel's build dir hands you clang-only flags (`-mstack-alignment=8`, `-mretpoline-external-thunk`) and then invokes gcc — that is the failure this Makefile exists to prevent. Detection order: `CC_FAMILY` → `CONFIG_CC_IS_{CLANG,GCC}` in `$(KDIR)/include/config/auto.conf` → `LINUX_COMPILER` in `$(KDIR)/include/generated/compile.h` → fall back to gcc with a warning. CachyOS ships a mix: `*-cachyos` is clang/LLD, `*-cachyos-lts` and `*-arch1-1` are gcc.
 - Firmware loaded via kernel `request_firmware()` — expects files in `/lib/firmware/avermedia/`
 - Debugfs at `/sys/kernel/debug/c985/` exposes: `regs`, `mbox_log`, `frame_read`, `cpr_peek`, `dma_status`
 - Module dependencies: `videobuf2-common`, `videobuf2-memops`, `videobuf2-dma-sg`, `videobuf2-v4l2` (loaded by bind script)

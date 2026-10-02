@@ -16,7 +16,7 @@ Linux V4L2 driver for the AVerMedia C985 (1af2:a001), implementing support for t
 ## Requirements
 
 - Linux kernel headers (matching running kernel)
-- Clang/LLVM (`LLVM=1` required for build)
+- The same compiler family the running kernel was built with (gcc or clang — see [Building](#building))
 - Physical C985 hardware
 - `sudo` for module bind/unbind
 - Firmware files in `/lib/firmware/avermedia/`
@@ -25,7 +25,7 @@ Linux V4L2 driver for the AVerMedia C985 (1af2:a001), implementing support for t
 
 ```bash
 # 1. Build the kernel module
-cd kernel/c985 && LLVM=1 make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+cd kernel/c985 && make
 
 # 2. Install firmware (see Firmware section below)
 
@@ -52,14 +52,37 @@ Firmware can be extracted from the [official AVerMedia Windows driver](https://w
 
 ```bash
 cd kernel/c985
-LLVM=1 make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+make          # build for the running kernel
 ```
 
-Output: `c985.ko`
+Output: `c985.ko`. Clean with `make clean`.
 
-Clean: `LLVM=1 make -C /lib/modules/$(uname -r)/build M=$(pwd) clean`
+Common options (full list: `make help`):
 
-**Note:** `LLVM=1` (Clang) is required — GCC builds are not supported.
+```bash
+make KVER=7.2.7-1-cachyos     # build against a specific installed kernel
+make KBUILD_FLAGS='W=1'       # verbose build
+make CC_FAMILY=clang          # override compiler auto-detection
+make help                     # list targets and variables
+```
+
+**Compiler family matters.** An out-of-tree module must be built with the *same
+compiler family* as the target kernel, because kbuild bakes the kernel's own
+toolchain flags into `KBUILD_CFLAGS` (e.g. `-mpreferred-stack-boundary=3` for
+gcc, `-mstack-alignment=8` for clang) and the wrong compiler rejects them. The
+kernel build tree injects the correct flags but does **not** select the compiler
+for you, so this Makefile detects the family and passes `LLVM=1` only when it is
+actually needed. A plain `make` targets the running kernel (`uname -r`) and
+therefore always matches it. Every build prints the resolved toolchain:
+
+```
+  KVER     7.2.7-1-cachyos
+  KDIR     /lib/modules/7.2.7-1-cachyos/build
+  CC       clang
+```
+
+The detection order and the full `$(LLVM)` / `CONFIG_CC_IS_*` rationale live in
+the comments at the top of `kernel/c985/Makefile` and in `make help`.
 
 ## Binding / Unbinding
 
@@ -176,7 +199,7 @@ PCIe → BAR0 (DMA) / BAR1 (Mailbox/ARM) → Firmware (QPSOS) → v4l2 → /dev/
 ## Known Limitations
 
 - No support for other AVerMedia models
-- Requires Clang/LLVM for build
+- Build requires the same compiler family as the target kernel (gcc or clang, auto-selected)
 - Audio capture exposes raw LPCM; userspace consumes it as ordinary PCM (e.g., ffmpeg `-f alsa -i hw:X -f s16le -`)
 
 Video capture uses `vb2_dma_sg` (scatter-gather) with a 64-bit DMA mask. Each Y/U/V plane read walks the `sg_table` emitting one chained descriptor per SG element (`c985_dma_read_frame_mode_sg`). Buffer count is a hard 4 (firmware 4-slot ring).
