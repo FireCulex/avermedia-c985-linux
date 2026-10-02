@@ -40,7 +40,10 @@ Checks
 Usage
 -----
   SYNC_TEST_VIDEO=/path/to/capture.mkv pytest tests/test_sync.py -s
-  (defaults to /mnt/wd_black/Videos/windows_sync_test.mp4)
+
+The container must be a recording of the leader above. There is no default
+path: when SYNC_TEST_VIDEO is unset (or the file is missing) these tests are
+skipped.
 """
 
 import math
@@ -52,8 +55,14 @@ import tempfile
 import pytest
 
 
-VIDEO_PATH = os.environ.get(
-    "SYNC_TEST_VIDEO", "/mnt/wd_black/Videos/windows_sync_test.mp4"
+VIDEO_PATH = os.environ.get("SYNC_TEST_VIDEO")
+
+# No default path: the source recording is machine/user-specific. Skip rather
+# than fail when it is absent, so a plain `pytest tests/` stays green on a
+# checkout without a capture handy.
+pytestmark = pytest.mark.skipif(
+    not VIDEO_PATH or not os.path.exists(VIDEO_PATH),
+    reason="set SYNC_TEST_VIDEO=/path/to/capture.mkv to an A/V sync leader recording",
 )
 
 AUDIO_SR = 48000

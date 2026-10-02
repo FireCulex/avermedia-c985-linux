@@ -151,6 +151,15 @@ C985_DEVICE=/dev/video2 ./run_tests.sh
 - `sudo` for module bind/unbind
 - Python venv auto-created at `.venv/` with `pytest`
 - Kernel module at `kernel/c985/c985.ko` must exist (build first)
+- **A moving signal on the capture input** (see [Input signal](#input-signal))
+
+**Input signal.** These are capture-quality tests, so the source must be moving.
+`test_capture.py`'s frame-uniqueness and effective-FPS checks fail on a static or
+black input, so feed the card something in motion. For the A/V sync test
+specifically, play the project's sync-test leader — an A/V sync test video with a
+beep + on-screen toggle every second, panned right → center → left → center:
+
+  <https://www.youtube.com/watch?v=QzomK1fdSUg>
 
 **What tests verify:**
 - Device format: 1920×1080 YUV420 (YU12)
@@ -158,6 +167,17 @@ C985_DEVICE=/dev/video2 ./run_tests.sh
 - Monotonic sequence numbers (no drops/duplicates)
 - Frame uniqueness (visual difference via Y-plane comparison)
 - Effective FPS ≥ 15 (detects static/black frames)
+
+**`test_sync.py`** is different: it does **not** touch the capture device. It
+analyzes an already-recorded container of the leader above. There is no default
+path — point it at your recording with `SYNC_TEST_VIDEO`, or the test is skipped:
+
+```bash
+SYNC_TEST_VIDEO=/path/to/capture.mkv pytest tests/test_sync.py -s
+```
+
+`./run_tests.sh` runs the whole `tests/` directory, so `test_sync.py` is skipped
+there unless `SYNC_TEST_VIDEO` is set.
 
 ## Debugfs Interface
 

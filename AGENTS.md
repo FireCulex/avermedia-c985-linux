@@ -31,6 +31,8 @@ C985_DEVICE=/dev/video2 ./run_tests.sh      # Override device path
 - Python venv auto-created at `.venv/` with `pytest` (see `requirements.txt`)
 - Kernel module at `kernel/c985/c985.ko` must exist (build first)
 - Firmware in `/lib/firmware/avermedia/`: `qpvidfwpcie.bin` + `qpaudfw.bin`
+- **Moving signal on the capture input** — `test_capture.py`'s uniqueness/effective-FPS checks fail on static/black input
+- `test_sync.py` analyzes a pre-recorded container of the A/V sync leader (`https://www.youtube.com/watch?v=QzomK1fdSUg`); set `SYNC_TEST_VIDEO=/path/to/capture.mkv` or it is skipped (no bundled/default path)
 
 ## Architecture Notes
 - **Kernel module**: `kernel/c985/` — 10 source files, builds to `c985.ko`
